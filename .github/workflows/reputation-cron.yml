@@ -8,16 +8,59 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
+    env:
+      APP_URL: ${{ secrets.APP_URL }}
+      CRON_SECRET: ${{ secrets.CRON_SECRET }}
     steps:
+      - name: Resolve the app origin
+        run: |
+          set -euo pipefail
+          APP="${APP_URL:-https://stellar-intel.vercel.app}"
+          echo "APP=${APP%/}" >> "$GITHUB_ENV"
+
+      - name: Validate cron configuration
+        run: |
+          set -euo pipefail
+          if [ -z "${CRON_SECRET:-}" ]; then
+            echo "::error::CRON_SECRET is not configured. Set it in Settings > Secrets and variables > Actions to match the deployment's CRON_SECRET."
+            exit 1
+          fi
+
       - name: Refresh
         run: |
-          curl -fsS -X POST "${{ secrets.APP_URL }}/api/reputation/refresh" \
-            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}"
+          set -euo pipefail
+          CODE=$(curl -sS -L --proto '=https' --fail-with-body \
+            -o /tmp/refresh.out -w '%{http_code}' \
+            -X POST "$APP/api/reputation/refresh" \
+            -H "Authorization: Bearer $CRON_SECRET") || true
+          cat /tmp/refresh.out
+          case "$CODE" in
+            2*) ;;
+            *) echo "::error::refresh returned HTTP $CODE"; exit 1 ;;
+          esac
+
       - name: Reconcile
         run: |
-          curl -fsS -X GET "${{ secrets.APP_URL }}/api/reputation/reconcile" \
-            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}"
+          set -euo pipefail
+          CODE=$(curl -sS -L --proto '=https' --fail-with-body \
+            -o /tmp/reconcile.out -w '%{http_code}' \
+            "$APP/api/reputation/reconcile" \
+            -H "Authorization: Bearer $CRON_SECRET") || true
+          cat /tmp/reconcile.out
+          case "$CODE" in
+            2*) ;;
+            *) echo "::error::reconcile returned HTTP $CODE"; exit 1 ;;
+          esac
+
       - name: Publisher tick
         run: |
-          curl -fsS -X GET "${{ secrets.APP_URL }}/api/publisher/tick" \
-            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}"
+          set -euo pipefail
+          CODE=$(curl -sS -L --proto '=https' --fail-with-body \
+            -o /tmp/tick.out -w '%{http_code}' \
+            "$APP/api/publisher/tick" \
+            -H "Authorization: Bearer $CRON_SECRET") || true
+          cat /tmp/tick.out
+          case "$CODE" in
+            2*) ;;
+            *) echo "::error::publisher tick returned HTTP $CODE"; exit 1 ;;
+          esac
