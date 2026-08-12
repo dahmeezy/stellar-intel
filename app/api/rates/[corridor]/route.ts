@@ -1,11 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { checkRateLimit, getClientIp } from '@/lib/api/rate-limit';
 import { withRequestLogger } from '@/lib/logger';
-import { isValidCorridorId, isAnchorDegraded } from '@/lib/stellar/anchors';
-import { fetchCorridorRates } from '@/lib/stellar/server-rates';
+import { isValidCorridorId } from '@/lib/stellar/anchors';
 import { AMOUNT_PATTERN } from '@/lib/patterns';
-import { getCachedRate, setCachedRate, invalidateCachedRates } from '@/lib/api/rate-cache';
-import { recordRatesCacheHit, recordRatesCacheMiss } from '@/lib/metrics';
+import { resolveCorridorRates } from '@/lib/api/rates-resolver';
+import { FRESH_TTL_MS } from '@/lib/api/rate-cache';
+
+/** How long a CDN may serve stale without reaching the origin. */
+const CDN_STALE_SECONDS = 60;
 
 // Live anchor calls must run per-request, never at build time.
 export const dynamic = 'force-dynamic';
@@ -21,7 +23,7 @@ export async function GET(
 ): Promise<NextResponse> {
   return withRequestLogger(request, 'api.rates', async (logger) => {
     const ip = getClientIp(request.headers);
-    const rl = checkRateLimit(ip, { bucket: 'api.rates', maxRequests: 90 });
+    const rl = await checkRateLimit(ip, { bucket: 'api.rates', maxRequests: 90 });
     if (!rl.allowed) {
       logger.warn({ event: 'rate_limit_exceeded', ip, retryAfter: rl.retryAfter });
       return NextResponse.json(
@@ -63,31 +65,25 @@ export async function GET(
       pragma.includes('no-cache') ||
       url.searchParams.get('forceRefresh') === 'true';
 
-    const cached = forceRefresh ? undefined : getCachedRate(corridor, amount);
-    const hasHealthyCachedResult =
-      cached !== undefined && !cached.rates.some((rate) => isAnchorDegraded(rate.anchorId));
-
     // Hit/miss counters feed the /api/metrics snapshot (#737). A bypassed or
     // degraded-anchor lookup counts as a miss — it still costs an upstream fetch.
-    if (hasHealthyCachedResult) {
-      recordRatesCacheHit();
-    } else {
-      recordRatesCacheMiss();
-    }
+    const {
+      comparison: result,
+      servedFromCache,
+      cacheStatus,
+    } = await resolveCorridorRates(corridor, amount, {
+      forceRefresh,
+    });
 
-    let result = cached;
-    if (!result || !hasHealthyCachedResult) {
-      if (cached) {
-        for (const rate of cached.rates) {
-          if (isAnchorDegraded(rate.anchorId)) {
-            invalidateCachedRates(rate.anchorId);
-          }
-        }
-      }
-      result = await fetchCorridorRates(corridor, amount);
-      if (result.rates.length > 0) {
-        setCachedRate(corridor, amount, result);
-      }
+    if (servedFromCache) {
+      logger.info({
+        event: 'rates_served_from_cache',
+        corridor,
+        amount,
+        cacheStatus,
+        quoted: result.rates.length,
+      });
+    } else {
       logger.info({
         event: 'rates_fetched',
         corridor,
@@ -96,13 +92,6 @@ export async function GET(
         failed: result.errors?.length ?? 0,
         forceRefresh,
       });
-    } else {
-      logger.info({
-        event: 'rates_served_from_cache',
-        corridor,
-        amount,
-        quoted: result.rates.length,
-      });
     }
 
     // Listing rates aren't a locked-in quote — execution re-authenticates and
@@ -110,7 +99,17 @@ export async function GET(
     // only affects how stale the comparison table can be, not correctness.
     return NextResponse.json(result, {
       headers: {
-        'Cache-Control': 'public, max-age=15, stale-while-revalidate=60',
+        // max-age mirrors the server-side fresh window; the CDN stale window
+        // deliberately does NOT mirror STALE_TTL_MS. The server revalidates
+        // behind the first stale request, so its 10-minute window self-heals in
+        // seconds. A CDN just serves stale — giving it 10 minutes would let a
+        // rate-comparison page show ten-minute-old rates without the origin
+        // ever being asked.
+        'Cache-Control': `public, max-age=${FRESH_TTL_MS / 1000}, stale-while-revalidate=${CDN_STALE_SECONDS}`,
+        // HIT = fresh, STALE = served now and refreshing behind this request,
+        // MISS = fetched live. Lets a caller see cache behaviour without
+        // guessing from latency.
+        'X-Cache': cacheStatus,
         'X-RateLimit-Remaining': String(rl.remaining),
       },
     });

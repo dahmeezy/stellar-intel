@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render } from '@testing-library/react';
 import HomePage from '@/app/page';
 
@@ -33,6 +33,10 @@ vi.mock('@/hooks/useAnchorRates', () => ({
           fee: 1,
           totalReceived: 158000,
           source: 'sep38',
+          // Fixed rather than relative to Date.now(): the test suite freezes
+          // system time to 2026-01-01T00:00:00Z, so this must stay in sync
+          // with that value to keep the QuotePill countdown deterministic.
+          expiresAt: new Date('2026-01-01T00:01:00Z'),
         },
       ],
       bestRateId: 'anchor-a',
@@ -43,16 +47,38 @@ vi.mock('@/hooks/useAnchorRates', () => ({
 }));
 
 describe('HomePage', () => {
-  it('renders execution-layer hero copy', () => {
-    const { getByRole } = render(<HomePage />);
-    const heading = getByRole('heading', { level: 1 });
-    expect(heading.textContent).toContain('The execution layer for');
-    expect(heading.textContent).toContain('stablecoin off-ramps.');
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
   });
 
-  it('subcopy references the execution layer', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('renders health-monitor hero copy', () => {
+    const { getByRole } = render(<HomePage />);
+    const heading = getByRole('heading', { level: 1 });
+    expect(heading.textContent).toContain('Health and reputation monitoring');
+    expect(heading.textContent).toContain('for every Stellar anchor.');
+  });
+
+  it('subcopy leads with the probe/reputation framing', () => {
     const { getByText } = render(<HomePage />);
-    expect(getByText(/live sep-38 quotes across every stellar anchor/i)).toBeTruthy();
+    expect(getByText(/uptime, quote-latency, and rate-drift probes/i)).toBeTruthy();
+  });
+
+  it('keeps no intent framing above the fold', () => {
+    const { getByRole, getByText } = render(<HomePage />);
+    expect(getByRole('heading', { level: 1 }).textContent).not.toMatch(/intent/i);
+    expect(getByText(/uptime, quote-latency, and rate-drift probes/i).textContent).not.toMatch(
+      /intent/i
+    );
+  });
+
+  it('keeps the intent framing further down the page', () => {
+    const { getByText } = render(<HomePage />);
+    expect(getByText(/sign a single intent in freighter/i)).toBeTruthy();
   });
 
   it('off-ramp card is the primary CTA and links to /offramp', () => {

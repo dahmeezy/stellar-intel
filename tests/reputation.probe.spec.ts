@@ -1,5 +1,7 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
+  AnchorHealthTracker,
+  failingDimensions,
   InMemoryProbeStore,
   probeAnchor,
   runProbe,
@@ -12,12 +14,25 @@ import {
   probeQuoteLatency,
   probeAllAnchorQuotes,
   quoteLatencyPercentiles,
+  probeIssuerMismatch,
+  probeAllAnchorIssuers,
+  probeTomlIntegrity,
+  probeAllAnchorIntegrity,
+  DurableProbeStore,
   type TomlProbeResult,
   type AnchorQuote,
   type RateProbeResult,
   type QuoteProbeResult,
+  type IssuerCheckResult,
+  type ProbeLedgerSink,
+  type DriftSample,
+  type HealthAlert,
+  type ProbeSample,
 } from '@/lib/reputation/probe';
-import type { Anchor } from '@/types';
+import { healthStatusFor, isDegradingTransition } from '@/lib/reputation/thresholds';
+import type { Anchor, Sep1TomlData } from '@/types';
+import type { ProbeLedgerRow } from '@/types/reputation';
+import type { TomlResult } from '@/lib/stellar/sep1';
 
 /** Deterministic clock: returns `start`, then advances by `step` each call. */
 function steppingClock(start = 1000, step = 120): () => number {
@@ -416,5 +431,503 @@ describe('quote-latency probe', () => {
   it('returns null when an anchor+corridor has no reachable quote samples', () => {
     const store = new InMemoryProbeStore();
     expect(quoteLatencyPercentiles('unknown.example', 'usdc-ngn', store)).toBeNull();
+  });
+});
+
+const issuerMatching = async (): Promise<IssuerCheckResult> => ({
+  ok: true,
+  advertisedIssuer: 'GADVERTISED',
+  actualIssuer: 'GADVERTISED',
+});
+const issuerMismatched = async (): Promise<IssuerCheckResult> => ({
+  ok: true,
+  advertisedIssuer: 'GADVERTISED',
+  actualIssuer: 'GIMPOSTOR',
+});
+const issuerUnreachable = async (): Promise<IssuerCheckResult> => ({
+  ok: false,
+  advertisedIssuer: null,
+  actualIssuer: null,
+  error: 'HTTP 503',
+});
+
+describe('issuer-mismatch probe', () => {
+  it('records reachable=true when the advertised and actual issuer match', async () => {
+    const store = new InMemoryProbeStore();
+    const sample = await probeIssuerMismatch(testAnchor(), store, { checkIssuer: issuerMatching });
+
+    expect(sample.reachable).toBe(true);
+    expect(sample.failureType ?? null).toBeNull();
+    expect(sample.error).toBeUndefined();
+  });
+
+  it('flags a mismatch with a distinct failure type and a descriptive error', async () => {
+    const store = new InMemoryProbeStore();
+    const anchor = testAnchor({ assetCode: 'USDC' });
+    const sample = await probeIssuerMismatch(anchor, store, { checkIssuer: issuerMismatched });
+
+    expect(sample.reachable).toBe(false);
+    expect(sample.failureType).toBe('mismatch');
+    expect(sample.error).toContain('GADVERTISED');
+    expect(sample.error).toContain('GIMPOSTOR');
+  });
+
+  it('classifies a genuine probe failure like the other probes, not as a mismatch', async () => {
+    const store = new InMemoryProbeStore();
+    const sample = await probeIssuerMismatch(testAnchor(), store, {
+      checkIssuer: issuerUnreachable,
+    });
+
+    expect(sample.reachable).toBe(false);
+    expect(sample.failureType).toBe('http');
+    expect(sample.error).toBe('HTTP 503');
+  });
+
+  it('records unreachable (does not throw) when the check helper throws', async () => {
+    const store = new InMemoryProbeStore();
+    const throwsCheck = async (): Promise<IssuerCheckResult> => {
+      throw new Error('ENOTFOUND');
+    };
+    const sample = await probeIssuerMismatch(testAnchor(), store, { checkIssuer: throwsCheck });
+
+    expect(sample.reachable).toBe(false);
+    expect(sample.error).toContain('ENOTFOUND');
+  });
+
+  it('probeAllAnchorIssuers checks every anchor concurrently', async () => {
+    const store = new InMemoryProbeStore();
+    const anchors = [
+      testAnchor({ id: 'a', homeDomain: 'a.example' }),
+      testAnchor({ id: 'b', homeDomain: 'b.example' }),
+    ];
+    const samples = await probeAllAnchorIssuers(store, { checkIssuer: issuerMatching }, anchors);
+
+    expect(samples).toHaveLength(2);
+    expect(store.samples('a.example')).toHaveLength(1);
+    expect(store.samples('b.example')).toHaveLength(1);
+  });
+});
+
+function tomlData(over: Partial<Sep1TomlData> = {}): Sep1TomlData {
+  return {
+    domain: 'anchor.example',
+    TRANSFER_SERVER_SEP0024: 'https://anchor.example/sep24',
+    TRANSFER_SERVER: null,
+    DIRECT_PAYMENT_SERVER: null,
+    ANCHOR_QUOTE_SERVER: null,
+    WEB_AUTH_ENDPOINT: null,
+    SIGNING_KEY: 'GABCDEF',
+    NETWORK_PASSPHRASE: null,
+    ORG_URL: null,
+    ORG_SUPPORT_EMAIL: null,
+    ORG_SUPPORT_URL: null,
+    CURRENCIES: [{ code: 'USDC', issuer: 'GISSUER' }],
+    capabilities: { sep10: false, sep24: true, sep38: false, sep12: true },
+    ...over,
+  };
+}
+
+const tomlValid = async (): Promise<TomlResult> => ({ ok: true, data: tomlData() });
+const tomlUnreachable = async (): Promise<TomlResult> => ({ ok: false, error: 'HTTP 503' });
+
+describe('toml-integrity probe', () => {
+  it('records reachable=true and remembers the snapshot when the toml validates clean', async () => {
+    const store = new InMemoryProbeStore();
+    const remembered: Sep1TomlData[] = [];
+    const sample = await probeTomlIntegrity('anchor.example', store, {
+      fetchToml: tomlValid,
+      getLastKnownGood: () => null,
+      recordLastKnownGood: (_domain, toml) => remembered.push(toml),
+    });
+
+    expect(sample.reachable).toBe(true);
+    expect(sample.failureType ?? null).toBeNull();
+    expect(remembered).toHaveLength(1);
+  });
+
+  it('flags a missing SIGNING_KEY with the integrity failure type', async () => {
+    const store = new InMemoryProbeStore();
+    const fetchToml = async (): Promise<TomlResult> => ({
+      ok: true,
+      data: tomlData({ SIGNING_KEY: null }),
+    });
+    const sample = await probeTomlIntegrity('anchor.example', store, {
+      fetchToml,
+      getLastKnownGood: () => null,
+    });
+
+    expect(sample.reachable).toBe(false);
+    expect(sample.failureType).toBe('integrity');
+    expect(sample.error).toContain('SIGNING_KEY');
+  });
+
+  it('does not overwrite the last known-good snapshot on a failed validation', async () => {
+    const store = new InMemoryProbeStore();
+    const recordLastKnownGood = vi.fn();
+    const fetchToml = async (): Promise<TomlResult> => ({
+      ok: true,
+      data: tomlData({ SIGNING_KEY: null }),
+    });
+    await probeTomlIntegrity('anchor.example', store, {
+      fetchToml,
+      getLastKnownGood: () => null,
+      recordLastKnownGood,
+    });
+
+    expect(recordLastKnownGood).not.toHaveBeenCalled();
+  });
+
+  it('classifies a genuine probe failure like the other probes, not as integrity', async () => {
+    const store = new InMemoryProbeStore();
+    const sample = await probeTomlIntegrity('anchor.example', store, {
+      fetchToml: tomlUnreachable,
+    });
+
+    expect(sample.reachable).toBe(false);
+    expect(sample.failureType).toBe('http');
+    expect(sample.error).toBe('HTTP 503');
+  });
+
+  it('probeAllAnchorIntegrity checks every anchor concurrently', async () => {
+    const store = new InMemoryProbeStore();
+    const anchors = [
+      testAnchor({ id: 'a', homeDomain: 'a.example' }),
+      testAnchor({ id: 'b', homeDomain: 'b.example' }),
+    ];
+    const samples = await probeAllAnchorIntegrity(
+      store,
+      { fetchToml: tomlValid, getLastKnownGood: () => null },
+      anchors
+    );
+
+    expect(samples).toHaveLength(2);
+    expect(store.samples('a.example')).toHaveLength(1);
+    expect(store.samples('b.example')).toHaveLength(1);
+  });
+});
+
+describe('DurableProbeStore', () => {
+  function fakeSink(): ProbeLedgerSink & { rows: ProbeLedgerRow[] } {
+    const rows: ProbeLedgerRow[] = [];
+    return {
+      rows,
+      async recordProbeSample(row) {
+        rows.push(row);
+      },
+    };
+  }
+
+  it('tags every recorded sample with its fixed kind and persists to the sink', async () => {
+    const sink = fakeSink();
+    const store = new DurableProbeStore(sink, 'uptime');
+
+    await probeAnchor('up.example', store, { fetchToml: ok, now: steppingClock(1000, 50) });
+    await store.drain();
+
+    expect(sink.rows).toHaveLength(1);
+    expect(sink.rows[0]).toMatchObject({
+      domain: 'up.example',
+      kind: 'uptime',
+      corridor: null,
+      reachable: true,
+    });
+  });
+
+  it('persists quote-latency samples under the quote kind, with the corridor preserved', async () => {
+    const sink = fakeSink();
+    const store = new DurableProbeStore(sink, 'quote');
+
+    await probeQuoteLatency(testAnchor(), 'usdc-ngn', store, { fetchQuote: quoteOk });
+    await store.drain();
+
+    expect(sink.rows[0]).toMatchObject({ kind: 'quote', corridor: 'usdc-ngn' });
+  });
+
+  it('persists issuer-mismatch samples under their own kind', async () => {
+    const sink = fakeSink();
+    const store = new DurableProbeStore(sink, 'issuer-mismatch');
+
+    await probeIssuerMismatch(testAnchor(), store, { checkIssuer: issuerMismatched });
+    await store.drain();
+
+    expect(sink.rows[0]).toMatchObject({ kind: 'issuer-mismatch', failureType: 'mismatch' });
+  });
+
+  it('persists toml-integrity samples under their own kind', async () => {
+    const sink = fakeSink();
+    const store = new DurableProbeStore(sink, 'toml-integrity');
+    const fetchToml = async (): Promise<TomlResult> => ({
+      ok: true,
+      data: tomlData({ SIGNING_KEY: null }),
+    });
+
+    await probeTomlIntegrity('anchor.example', store, { fetchToml, getLastKnownGood: () => null });
+    await store.drain();
+
+    expect(sink.rows[0]).toMatchObject({ kind: 'toml-integrity', failureType: 'integrity' });
+  });
+
+  it('does not throw when the sink fails to persist a sample', async () => {
+    const failingSink: ProbeLedgerSink = {
+      async recordProbeSample() {
+        throw new Error('db unavailable');
+      },
+    };
+    const store = new DurableProbeStore(failingSink, 'uptime');
+
+    await probeAnchor('up.example', store, { fetchToml: ok });
+    await expect(store.drain()).resolves.toBeUndefined();
+  });
+});
+
+describe('probe-failure alerting', () => {
+  const upSample = (latencyMs = 100): ProbeSample => ({
+    domain: 'anchor.example',
+    reachable: true,
+    latencyMs,
+    at: 0,
+    failureType: null,
+  });
+  const downSample = (): ProbeSample => ({
+    domain: 'anchor.example',
+    reachable: false,
+    latencyMs: 0,
+    at: 0,
+    failureType: 'timeout',
+    error: 'ETIMEDOUT',
+  });
+  const driftSample = (flagged: boolean): DriftSample => ({
+    anchorId: 'anchor-1',
+    corridor: 'usdc-ngn',
+    rate: 1,
+    medianRate: 1,
+    deviationPercent: flagged ? 10 : 0,
+    flagged,
+    at: 0,
+  });
+
+  describe('health thresholds', () => {
+    it('latches degraded then down as the failure streak grows', () => {
+      expect(healthStatusFor(0, 3, 6)).toBe('healthy');
+      expect(healthStatusFor(2, 3, 6)).toBe('healthy');
+      expect(healthStatusFor(3, 3, 6)).toBe('degraded');
+      expect(healthStatusFor(5, 3, 6)).toBe('degraded');
+      expect(healthStatusFor(6, 3, 6)).toBe('down');
+    });
+
+    it('never makes down easier to reach than degraded when misconfigured', () => {
+      expect(healthStatusFor(2, 3, 1)).toBe('healthy');
+      expect(healthStatusFor(3, 3, 1)).toBe('down');
+    });
+
+    it('treats only worsening transitions as alertable', () => {
+      expect(isDegradingTransition('healthy', 'degraded')).toBe(true);
+      expect(isDegradingTransition('healthy', 'down')).toBe(true);
+      expect(isDegradingTransition('degraded', 'down')).toBe(true);
+      expect(isDegradingTransition('degraded', 'degraded')).toBe(false);
+      expect(isDegradingTransition('down', 'degraded')).toBe(false);
+      expect(isDegradingTransition('degraded', 'healthy')).toBe(false);
+    });
+  });
+
+  describe('failingDimensions', () => {
+    it('reports no failures for an all-clear cycle', () => {
+      expect(
+        failingDimensions(
+          { uptime: upSample(), latency: [upSample()], drift: driftSample(false) },
+          5000
+        )
+      ).toEqual([]);
+    });
+
+    it('flags uptime when the toml probe was unreachable', () => {
+      expect(failingDimensions({ uptime: downSample() }, 5000)).toEqual(['uptime']);
+    });
+
+    it('flags latency for a reachable but over-budget quote', () => {
+      expect(failingDimensions({ latency: [upSample(9000)] }, 5000)).toEqual(['latency']);
+      expect(failingDimensions({ latency: [upSample(4999)] }, 5000)).toEqual([]);
+    });
+
+    it('flags drift only when the quote was flagged off-median', () => {
+      expect(failingDimensions({ drift: driftSample(true) }, 5000)).toEqual(['drift']);
+      expect(failingDimensions({ drift: driftSample(false) }, 5000)).toEqual([]);
+    });
+
+    it('returns every failing dimension in a stable order', () => {
+      expect(
+        failingDimensions(
+          { drift: driftSample(true), latency: [upSample(9000)], uptime: downSample() },
+          5000
+        )
+      ).toEqual(['uptime', 'latency', 'drift']);
+    });
+
+    it('ignores dimensions the cycle never probed', () => {
+      expect(failingDimensions({}, 5000)).toEqual([]);
+    });
+  });
+
+  describe('AnchorHealthTracker', () => {
+    // Acceptance criteria (#D016): a simulated run of consecutive failures
+    // crosses the debounce threshold and triggers exactly one alert naming the
+    // failing dimension.
+    it('alerts exactly once, on the cycle that crosses the debounce threshold', async () => {
+      const onAlert = vi.fn();
+      const tracker = new AnchorHealthTracker({
+        degradeAfter: 3,
+        downAfter: 99,
+        onAlert,
+        now: () => 5000,
+      });
+
+      const alerts: (HealthAlert | null)[] = [];
+      for (let i = 0; i < 5; i++) {
+        alerts.push(await tracker.observe('anchor-1', { uptime: downSample() }));
+      }
+
+      // First two failures are debounced; the third crosses the threshold.
+      expect(alerts[0]).toBeNull();
+      expect(alerts[1]).toBeNull();
+      expect(alerts[2]).not.toBeNull();
+      // Further failures at the same status stay silent.
+      expect(alerts[3]).toBeNull();
+      expect(alerts[4]).toBeNull();
+
+      expect(onAlert).toHaveBeenCalledTimes(1);
+      expect(onAlert).toHaveBeenCalledWith({
+        anchorId: 'anchor-1',
+        from: 'healthy',
+        to: 'degraded',
+        dimensions: ['uptime'],
+        consecutiveFailures: 3,
+        at: 5000,
+      });
+    });
+
+    it('does not alert on a single flaky cycle surrounded by healthy ones', async () => {
+      const onAlert = vi.fn();
+      const tracker = new AnchorHealthTracker({ degradeAfter: 3, onAlert });
+
+      for (const failing of [false, true, false, true, false, true, false]) {
+        await tracker.observe('anchor-1', { uptime: failing ? downSample() : upSample() });
+      }
+
+      expect(onAlert).not.toHaveBeenCalled();
+      expect(tracker.statusOf('anchor-1')).toEqual({
+        status: 'healthy',
+        consecutiveFailures: 0,
+        dimensions: [],
+      });
+    });
+
+    it('names every dimension that failed during the streak', async () => {
+      const onAlert = vi.fn();
+      const tracker = new AnchorHealthTracker({
+        degradeAfter: 3,
+        latencyBudgetMs: 5000,
+        onAlert,
+      });
+
+      await tracker.observe('anchor-1', { uptime: downSample() });
+      await tracker.observe('anchor-1', { latency: [upSample(9000)] });
+      const alert = await tracker.observe('anchor-1', { drift: driftSample(true) });
+
+      expect(alert?.dimensions).toEqual(['uptime', 'latency', 'drift']);
+      expect(onAlert).toHaveBeenCalledTimes(1);
+    });
+
+    it('escalates degraded to down with a second alert', async () => {
+      const onAlert = vi.fn();
+      const tracker = new AnchorHealthTracker({ degradeAfter: 2, downAfter: 4, onAlert });
+
+      const results: (HealthAlert | null)[] = [];
+      for (let i = 0; i < 5; i++) {
+        results.push(await tracker.observe('anchor-1', { uptime: downSample() }));
+      }
+
+      expect(results.map((r) => r?.to ?? null)).toEqual([null, 'degraded', null, 'down', null]);
+      expect(onAlert).toHaveBeenCalledTimes(2);
+      expect(onAlert).toHaveBeenLastCalledWith(
+        expect.objectContaining({ from: 'degraded', to: 'down', consecutiveFailures: 4 })
+      );
+    });
+
+    it('resets the streak and dimensions on recovery, without alerting', async () => {
+      const onAlert = vi.fn();
+      const tracker = new AnchorHealthTracker({ degradeAfter: 2, onAlert });
+
+      await tracker.observe('anchor-1', { uptime: downSample() });
+      await tracker.observe('anchor-1', { uptime: downSample() });
+      expect(tracker.statusOf('anchor-1').status).toBe('degraded');
+
+      await tracker.observe('anchor-1', { uptime: upSample() });
+      expect(tracker.statusOf('anchor-1')).toEqual({
+        status: 'healthy',
+        consecutiveFailures: 0,
+        dimensions: [],
+      });
+      // Only the degradation alerted; recovery did not.
+      expect(onAlert).toHaveBeenCalledTimes(1);
+
+      // A fresh streak alerts again once it re-crosses the threshold.
+      await tracker.observe('anchor-1', { drift: driftSample(true) });
+      const realert = await tracker.observe('anchor-1', { drift: driftSample(true) });
+      expect(realert?.dimensions).toEqual(['drift']);
+      expect(onAlert).toHaveBeenCalledTimes(2);
+    });
+
+    it('tracks each anchor independently', async () => {
+      const onAlert = vi.fn();
+      const tracker = new AnchorHealthTracker({ degradeAfter: 2, onAlert });
+
+      await tracker.observe('anchor-1', { uptime: downSample() });
+      await tracker.observe('anchor-2', { uptime: upSample() });
+      await tracker.observe('anchor-1', { uptime: downSample() });
+      await tracker.observe('anchor-2', { uptime: upSample() });
+
+      expect(onAlert).toHaveBeenCalledTimes(1);
+      expect(onAlert).toHaveBeenCalledWith(expect.objectContaining({ anchorId: 'anchor-1' }));
+      expect(tracker.snapshot()).toEqual({
+        'anchor-1': { status: 'degraded', consecutiveFailures: 2, dimensions: ['uptime'] },
+        'anchor-2': { status: 'healthy', consecutiveFailures: 0, dimensions: [] },
+      });
+    });
+
+    it('reports an untracked anchor as healthy', () => {
+      const tracker = new AnchorHealthTracker();
+      expect(tracker.statusOf('never-probed')).toEqual({
+        status: 'healthy',
+        consecutiveFailures: 0,
+        dimensions: [],
+      });
+      expect(tracker.snapshot()).toEqual({});
+    });
+
+    it('awaits an async alert hook before returning', async () => {
+      const seen: string[] = [];
+      const tracker = new AnchorHealthTracker({
+        degradeAfter: 1,
+        onAlert: async () => {
+          await Promise.resolve();
+          seen.push('hook');
+        },
+      });
+
+      await tracker.observe('anchor-1', { uptime: downSample() });
+      seen.push('after');
+
+      expect(seen).toEqual(['hook', 'after']);
+    });
+
+    it('accepts pre-computed failing dimensions', async () => {
+      const onAlert = vi.fn();
+      const tracker = new AnchorHealthTracker({ degradeAfter: 1, onAlert });
+
+      const alert = await tracker.observeFailures('anchor-1', ['drift']);
+
+      expect(alert).toMatchObject({ to: 'degraded', dimensions: ['drift'] });
+      expect(onAlert).toHaveBeenCalledTimes(1);
+    });
   });
 });

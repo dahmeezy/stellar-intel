@@ -4,12 +4,22 @@ import { authenticate, NetworkMismatchError } from '@/lib/stellar/sep10';
 import { initiateWithdraw, getWithdrawTransactionRecord } from '@/lib/stellar/sep24';
 import { getResolvedAnchorById } from '@/lib/stellar/anchors';
 import { buildWithdrawPayment, signAndSubmitPayment } from '@/lib/stellar/horizon';
+import {
+  assertSep38Capable,
+  postSep38Quote,
+  onQuoteExpired,
+  QuoteExpiredError,
+} from '@/lib/stellar/sep38';
 import { measureClient } from '@/lib/metrics';
+import { amountBucket, FUNNEL_EVENTS, trackFunnelEvent } from '@/lib/analytics';
 import { stepTimeEstimate } from '@/lib/stellar/step-estimates';
 import { classifyExecuteError, isRetryableExecuteError } from '@/lib/errors/messages';
-import type { AnchorRate, ExecuteDrawerStep } from '@/types';
+import type { AnchorRate, ExecuteDrawerStep, Sep38Quote } from '@/types';
 import { ErrorBoundary } from '@/components/ui/ErrorBoundary';
+import { QuotePill } from '@/components/ui/QuotePill';
 import { KycIframe } from './KycIframe';
+import { ConsentModal } from './ConsentModal';
+import { acceptTerms, hasAcceptedTerms } from '@/lib/consent';
 import { FLAGS } from '@/lib/flags';
 
 // ─── Step definitions ─────────────────────────────────────────────────────────
@@ -17,6 +27,7 @@ import { FLAGS } from '@/lib/flags';
 const STEP_LABELS: Record<ExecuteDrawerStep, string> = {
   idle: 'Ready',
   authenticating: 'Proving wallet ownership to anchor…',
+  quoting: 'Locking in a firm quote…',
   initiating: 'Initiating withdrawal…',
   kyc: 'Complete KYC in popup…',
   form: 'Complete KYC form…',
@@ -96,6 +107,17 @@ function ExecuteDrawerContent({
   const [kycUrl, setKycUrl] = useState<string | null>(null);
   const [kycOrigin, setKycOrigin] = useState<string | null>(null);
   const [showConfirmDialog, setShowConfirmDialog] = useState(false);
+  const [showConsent, setShowConsent] = useState(false);
+
+  // The firm SEP-38 quote locked in for this execution, when the anchor
+  // supports one — drives the expiry countdown shown in the summary panel.
+  const [firmQuote, setFirmQuote] = useState<Sep38Quote | null>(null);
+  // Set by the onQuoteExpired watcher; checked at the next safe checkpoint
+  // (before initiating and before building the payment) so a lapsed quote
+  // surfaces a re-quote prompt instead of silently completing at a stale
+  // price.
+  const quoteExpiredRef = useRef(false);
+  const quoteExpiryCleanupRef = useRef<(() => void) | null>(null);
 
   // Live downward-drag offset (px) of the mobile bottom sheet while a swipe is in
   // progress. 0 means the sheet is at rest. Driven by the touch handlers below.
@@ -113,10 +135,28 @@ function ExecuteDrawerContent({
   useEffect(() => {
     return () => {
       abortRef.current?.abort();
+      quoteExpiryCleanupRef.current?.();
     };
   }, []);
 
   const isOpen = rate !== null;
+  const openedForRef = useRef<string | null>(null);
+
+  // Fire when the drawer opens for a specific anchor + amount (once per open).
+  useEffect(() => {
+    if (!rate) {
+      openedForRef.current = null;
+      return;
+    }
+    const openKey = `${rate.anchorId}:${rate.corridorId}:${amount}`;
+    if (openedForRef.current === openKey) return;
+    openedForRef.current = openKey;
+    trackFunnelEvent(FUNNEL_EVENTS.executeDrawerOpened, {
+      corridor: rate.corridorId,
+      anchor: rate.anchorId,
+      amount_bucket: amountBucket(amount),
+    });
+  }, [rate, amount]);
 
   // Focus trap — keeps Tab/Shift+Tab cycling within the open dialog (or the
   // confirmation dialog on top of it, when shown) and restores focus to
@@ -169,17 +209,15 @@ function ExecuteDrawerContent({
 
     window.addEventListener('keydown', handleTab);
     return () => window.removeEventListener('keydown', handleTab);
-  }, [isOpen, showConfirmDialog]);
+  }, [isOpen, showConfirmDialog, step]);
 
-  // Handle escape key — close immediately when it's safe to do so (idle/done/
-  // error), otherwise prompt confirmation since a flow is in progress.
+  // Handle escape key — close immediately when it's safe to do so (idle/
+  // error), otherwise do nothing.
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape' || !isOpen) return;
-      if (['idle', 'done', 'error'].includes(step)) {
+      if (['idle', 'error'].includes(step)) {
         onClose();
-      } else {
-        setShowConfirmDialog(true);
       }
     };
 
@@ -219,13 +257,32 @@ function ExecuteDrawerContent({
   async function handleExecute() {
     if (!rate) return;
 
+    // First execution for this wallet requires acknowledging the Terms (#741).
+    // Placed here rather than on the button so any other caller of
+    // handleExecute — the error-state Retry, for one — is gated too.
+    if (!hasAcceptedTerms(publicKey)) {
+      setShowConsent(true);
+      return;
+    }
+
     abortRef.current?.abort();
     abortRef.current = new AbortController();
     const { signal } = abortRef.current;
 
+    const funnelProps = {
+      corridor: rate.corridorId,
+      anchor: rate.anchorId,
+      amount_bucket: amountBucket(amount),
+    };
+    trackFunnelEvent(FUNNEL_EVENTS.executionConfirmed, funnelProps);
+
     setStep('authenticating');
     setErrorMsg(null);
     setTxHash(null);
+    setFirmQuote(null);
+    quoteExpiredRef.current = false;
+    quoteExpiryCleanupRef.current?.();
+    quoteExpiryCleanupRef.current = null;
 
     try {
       // Step 0 — Resolve anchor capabilities
@@ -241,8 +298,37 @@ function ExecuteDrawerContent({
         return;
       }
 
+      // Step 1.5 — Lock in a firm SEP-38 quote, when the anchor advertises
+      // one, so the withdrawal executes at a binding price instead of the
+      // indicative rate shown in the table. Anchors without SEP-38 support
+      // fall through to the indicative flow unchanged.
+      let quoteId: string | undefined;
+      let quoteServer: string | null = null;
+      try {
+        quoteServer = assertSep38Capable(anchor);
+      } catch {
+        quoteServer = null;
+      }
+
+      if (quoteServer) {
+        setStep('quoting');
+        const buyAssetCode = rate.corridorId.split('-')[1]?.toUpperCase();
+        const quote = await postSep38Quote(quoteServer, auth.jwt, {
+          sell_asset: `stellar:${anchor.assetCode}:${anchor.assetIssuer}`,
+          buy_asset: `iso4217:${buyAssetCode}`,
+          sell_amount: amount,
+          context: 'sep24',
+        });
+        setFirmQuote(quote);
+        quoteId = quote.id;
+        quoteExpiryCleanupRef.current = onQuoteExpired(quote, () => {
+          quoteExpiredRef.current = true;
+        });
+      }
+
       // Step 2 — Initiate SEP-24 withdraw
       setStep('initiating');
+      if (quoteExpiredRef.current) throw new QuoteExpiredError();
       const withdrawResp = await initiateWithdraw(
         anchor,
         {
@@ -251,6 +337,7 @@ function ExecuteDrawerContent({
           amount,
           account: publicKey,
           jwt: auth.jwt,
+          ...(quoteId ? { quoteId } : {}),
         },
         signal
       );
@@ -270,6 +357,11 @@ function ExecuteDrawerContent({
       // Clear refs once the Promise has settled.
       kycResolveRef.current = null;
       kycRejectRef.current = null;
+
+      // KYC can take anywhere from seconds to minutes — re-check the firm
+      // quote here rather than silently building a payment against a price
+      // the anchor may no longer honor.
+      if (quoteExpiredRef.current) throw new QuoteExpiredError();
 
       // Step 4 — Fetch transaction record
       setStep('building');
@@ -299,6 +391,9 @@ function ExecuteDrawerContent({
       });
       setTxHash(result.hash ?? null);
       setStep('done');
+      trackFunnelEvent(FUNNEL_EVENTS.executionCompleted, funnelProps);
+      quoteExpiryCleanupRef.current?.();
+      quoteExpiryCleanupRef.current = null;
 
       // Hand tracking data to the page, then close so StatusTracker owns the viewport.
       onExecuteStarted(transactionId, transferServer, auth.jwt, anchor.homeDomain);
@@ -310,6 +405,10 @@ function ExecuteDrawerContent({
         setErrorMsg(err.message);
         setErrorIsRetryable(false);
         setStep('error');
+        trackFunnelEvent(FUNNEL_EVENTS.executionFailed, {
+          ...funnelProps,
+          error_class: 'network_mismatch',
+        });
         return;
       }
 
@@ -327,6 +426,10 @@ function ExecuteDrawerContent({
       setErrorMsg(classifyExecuteError(err));
       setErrorIsRetryable(isRetryableExecuteError(err));
       setStep('error');
+      trackFunnelEvent(FUNNEL_EVENTS.executionFailed, {
+        ...funnelProps,
+        error_class: 'execute_error',
+      });
     } finally {
       // Ensure refs are cleaned up even on unexpected throws.
       kycResolveRef.current = null;
@@ -381,6 +484,13 @@ function ExecuteDrawerContent({
 
   const handleKycError = (error: Error) => {
     kycRejectRef.current?.(error);
+  };
+
+  const handleConsentAccept = () => {
+    acceptTerms(publicKey);
+    setShowConsent(false);
+    // Re-enter execution now that consent is recorded.
+    void handleExecute();
   };
 
   const handleConfirmClose = () => {
@@ -445,7 +555,7 @@ function ExecuteDrawerContent({
               onClick={onClose}
               disabled={isRunning}
               aria-label="Close"
-              className="rounded-lg p-1 text-gray-400 hover:text-gray-600 disabled:opacity-40 dark:hover:text-gray-200"
+              className="rounded-lg p-1 text-secondary-text hover:text-gray-600 disabled:opacity-40 dark:hover:text-gray-200"
             >
               <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path
@@ -477,6 +587,20 @@ function ExecuteDrawerContent({
                     {rate.corridorId.split('-')[1]?.toUpperCase()}
                   </dd>
                 </div>
+                {firmQuote && (
+                  <div className="flex items-center justify-between border-t border-gray-100 pt-2 dark:border-gray-700">
+                    <dt className="text-gray-500">Price</dt>
+                    <dd>
+                      <QuotePill
+                        source="sep38"
+                        expiresAt={new Date(firmQuote.expires_at)}
+                        onExpire={() => {
+                          quoteExpiredRef.current = true;
+                        }}
+                      />
+                    </dd>
+                  </div>
+                )}
               </dl>
             </div>
           )}
@@ -577,6 +701,11 @@ function ExecuteDrawerContent({
       </div>
 
       {/* Confirmation Dialog */}
+      <ConsentModal
+        open={showConsent}
+        onAccept={handleConsentAccept}
+        onCancel={() => setShowConsent(false)}
+      />
       {showConfirmDialog && (
         <div className="fixed inset-0 z-50 flex items-center justify-center">
           <div className="fixed inset-0 bg-black/50" onClick={handleCancelClose} />
@@ -675,6 +804,7 @@ function ExecuteDrawerErrorFallback({
 
 const ORDERED_STEPS: ExecuteDrawerStep[] = [
   'authenticating',
+  'quoting',
   'initiating',
   'kyc',
   'form',
@@ -697,6 +827,8 @@ function StepIndicator({ step }: { step: ExecuteDrawerStep }) {
 
         return (
           <li key={s} className="flex items-center gap-2 text-xs">
+            {/* Pending steps stay low-contrast on purpose — inactive controls are
+                exempt from WCAG 1.4.3, and the active step has to stand out (#755). */}
             <span
               className={`flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-full text-[10px] font-bold
                 ${isComplete ? 'bg-green-500 text-white' : ''}
@@ -713,12 +845,12 @@ function StepIndicator({ step }: { step: ExecuteDrawerStep }) {
                   ? 'font-medium text-blue-600 dark:text-blue-400'
                   : isComplete || step === 'done'
                     ? 'text-gray-500 line-through dark:text-gray-400'
-                    : 'text-gray-400 dark:text-gray-500'
+                    : 'text-secondary-text'
               }
             >
               {STEP_LABELS[s]}
               {stepTimeEstimate(s) && (
-                <span className="text-gray-400 dark:text-gray-500"> ({stepTimeEstimate(s)})</span>
+                <span className="text-secondary-text"> ({stepTimeEstimate(s)})</span>
               )}
             </span>
           </li>

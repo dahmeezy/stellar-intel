@@ -4,9 +4,9 @@ use reputation::{Error, ReputationContract, ReputationContractClient};
 use soroban_sdk::{testutils::Address as _, Address, Env, String};
 
 fn setup(env: &Env) -> (ReputationContractClient<'_>, Address) {
-    let contract_id = env.register(ReputationContract, ());
-    let client = ReputationContractClient::new(env, &contract_id);
     let admin = Address::generate(env);
+    let contract_id = env.register(ReputationContract, (admin.clone(), admin.clone()));
+    let client = ReputationContractClient::new(env, &contract_id);
     (client, admin)
 }
 
@@ -16,7 +16,6 @@ fn revoked_publisher_cannot_submit_outcome() {
     env.mock_all_auths();
 
     let (client, admin) = setup(&env);
-    client.init(&admin);
 
     let publisher = Address::generate(&env);
     client.add_publisher(&admin, &publisher);
@@ -25,11 +24,25 @@ fn revoked_publisher_cannot_submit_outcome() {
     let corridor = String::from_str(&env, "NGN-USD");
     let outcome_hash = String::from_str(&env, "hash-1");
 
-    client.submit_outcome(&publisher, &anchor_id, &corridor, &outcome_hash, &1u64, &true);
+    client.submit_outcome(
+        &publisher,
+        &anchor_id,
+        &corridor,
+        &outcome_hash,
+        &1u64,
+        &true,
+    );
 
     client.revoke_publisher(&admin, &publisher);
 
     let outcome_hash2 = String::from_str(&env, "hash-2");
-    let res = client.try_submit_outcome(&publisher, &anchor_id, &corridor, &outcome_hash2, &1u64, &true);
+    let res = client.try_submit_outcome(
+        &publisher,
+        &anchor_id,
+        &corridor,
+        &outcome_hash2,
+        &1u64,
+        &true,
+    );
     assert_eq!(res, Err(Ok(Error::PublisherUnauthorized)));
 }

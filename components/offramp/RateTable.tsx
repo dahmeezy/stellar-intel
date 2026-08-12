@@ -2,12 +2,29 @@
 import { Fragment, useState, useCallback, useMemo, useRef, useEffect } from 'react';
 import Link from 'next/link';
 import { formatCurrency, formatRate } from '@/lib/utils';
-import { nextSortState, sortRates, type SortState } from '@/lib/sort';
-import type { RateComparison, AnchorRate, AnchorRateError } from '@/types';
+import {
+  ariaSortFor,
+  nextSortState,
+  parseSort,
+  serializeSort,
+  sortRates,
+  SORT_PARAM,
+  type RateSortKey,
+  type SortState,
+} from '@/lib/sort';
+import { FUNNEL_EVENTS, trackFunnelEvent } from '@/lib/analytics';
+import {
+  isIndicativeRateSource,
+  type RateComparison,
+  type AnchorRate,
+  type AnchorRateError,
+} from '@/types';
 import { Skeleton } from '@/components/ui/Skeleton';
 import { QuotePill } from '@/components/ui/QuotePill';
 import { AnchorLogo } from '@/components/ui/AnchorLogo';
 import { CopyButton } from '@/components/ui/CopyButton';
+import { Sparkline } from '@/components/ui/Sparkline';
+import { useRateHistory, describeRateTrend } from '@/hooks/useRateHistory';
 import { SortToggle } from './SortToggle';
 import { RateRowDetail } from './RateRowDetail';
 
@@ -37,7 +54,36 @@ export function RateTable({
   onRefresh,
 }: RateTableProps) {
   const [expiredAnchorIds, setExpiredAnchorIds] = useState<Set<string>>(new Set());
-  const [sort, setSort] = useState<SortState | null>(null);
+  // Rolling per-anchor rate history, appended once per SWR revalidation (#792).
+  const rateHistory = useRateHistory(rates);
+  // Initialised from the URL so a sorted view can be linked and survives a
+  // reload (#731). Read lazily rather than in an effect to avoid rendering the
+  // default order first and then snapping.
+  const [sort, setSort] = useState<SortState | null>(() =>
+    typeof window === 'undefined'
+      ? null
+      : parseSort(new URLSearchParams(window.location.search).get(SORT_PARAM))
+  );
+
+  // replaceState rather than push: sorting a table is not a navigation, and
+  // filling the back stack with sort states would make Back unusable.
+  const applySort = useCallback((key: RateSortKey) => {
+    setSort((prev) => {
+      const next = nextSortState(prev, key);
+
+      if (typeof window !== 'undefined') {
+        const params = new URLSearchParams(window.location.search);
+        const encoded = serializeSort(next);
+        if (encoded) params.set(SORT_PARAM, encoded);
+        else params.delete(SORT_PARAM);
+
+        const query = params.toString();
+        window.history.replaceState(null, '', query ? `?${query}` : window.location.pathname);
+      }
+
+      return next;
+    });
+  }, []);
   const [expandedAnchorId, setExpandedAnchorId] = useState<string | null>(null);
 
   const handleExpire = useCallback((anchorId: string) => {
@@ -64,13 +110,23 @@ export function RateTable({
 
   const [announcement, setAnnouncement] = useState('');
   const lastAnnouncedKeyRef = useRef<string | null>(null);
+  const lastViewedCorridorRef = useRef<string | null>(null);
+
+  // Fire once per corridor when the rate table first shows results for it.
+  useEffect(() => {
+    if (!rates?.corridorId) return;
+    if (rates.rates.length === 0 && (!rates.pending || rates.pending.length === 0)) return;
+    if (lastViewedCorridorRef.current === rates.corridorId) return;
+    lastViewedCorridorRef.current = rates.corridorId;
+    trackFunnelEvent(FUNNEL_EVENTS.rateTableViewed, { corridor: rates.corridorId });
+  }, [rates]);
 
   useEffect(() => {
     if (!rates || rates.rates.length === 0) return;
     const best = rates.rates.find((r) => r.anchorId === rates.bestRateId);
     if (!best || best.totalReceived == null) return;
 
-    const key = `${best.anchorId}:${best.totalReceived}`;
+    const key = `${best.anchorId}:${best.totalReceived}:${best.exchangeRate ?? ''}`;
     if (lastAnnouncedKeyRef.current === key) return;
     lastAnnouncedKeyRef.current = key;
 
@@ -145,32 +201,46 @@ export function RateTable({
             </th>
             <th
               scope="col"
+              aria-sort={ariaSortFor(sort, 'reputation')}
+              className="px-4 py-3 text-right font-medium text-gray-600 dark:text-gray-400"
+            >
+              <SortToggle
+                label="Reputation"
+                direction={sort?.key === 'reputation' ? sort.direction : null}
+                onClick={() => applySort('reputation')}
+              />
+            </th>
+            <th
+              scope="col"
+              aria-sort={ariaSortFor(sort, 'fee')}
               className="px-4 py-3 text-right font-medium text-gray-600 dark:text-gray-400"
             >
               <SortToggle
                 label="Fee"
                 direction={sort?.key === 'fee' ? sort.direction : null}
-                onClick={() => setSort((prev) => nextSortState(prev, 'fee'))}
+                onClick={() => applySort('fee')}
               />
             </th>
             <th
               scope="col"
+              aria-sort={ariaSortFor(sort, 'rate')}
               className="px-4 py-3 text-right font-medium text-gray-600 dark:text-gray-400"
             >
               <SortToggle
                 label="Rate"
                 direction={sort?.key === 'rate' ? sort.direction : null}
-                onClick={() => setSort((prev) => nextSortState(prev, 'rate'))}
+                onClick={() => applySort('rate')}
               />
             </th>
             <th
               scope="col"
+              aria-sort={ariaSortFor(sort, 'receive')}
               className="px-4 py-3 text-right font-medium text-gray-600 dark:text-gray-400"
             >
               <SortToggle
                 label="You Receive"
                 direction={sort?.key === 'receive' ? sort.direction : null}
-                onClick={() => setSort((prev) => nextSortState(prev, 'receive'))}
+                onClick={() => applySort('receive')}
               />
             </th>
             <th
@@ -184,7 +254,7 @@ export function RateTable({
         <tbody>
           {!isLoading && error && (
             <tr>
-              <td colSpan={5} className="px-4 py-8 text-center">
+              <td colSpan={6} className="px-4 py-8 text-center">
                 <p className="mb-3 text-sm text-red-500">{error}</p>
                 <button
                   onClick={() => window.location.reload()}
@@ -203,7 +273,7 @@ export function RateTable({
             anchorErrors.length === 0 &&
             (!rates.pending || rates.pending.length === 0) && (
               <tr>
-                <td colSpan={5} className="px-4 py-10 text-center">
+                <td colSpan={6} className="px-4 py-10 text-center">
                   <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
                     No rates available
                     {sourceCurrency && destCurrency
@@ -265,6 +335,14 @@ export function RateTable({
                             <span className="rounded-full bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-700 dark:bg-blue-900/40 dark:text-blue-300">
                               Best Rate
                             </span>
+                            {isIndicativeRateSource(rate.source) && (
+                              <span
+                                className="text-xs text-gray-500 dark:text-gray-400"
+                                title="This anchor's rate is an estimate, not a firm quote — it may change before you withdraw."
+                              >
+                                based on an indicative rate
+                              </span>
+                            )}
                             {savingsVsWorst !== null && savingsVsWorst > 0 && (
                               <span className="text-xs font-medium text-green-600 dark:text-green-400">
                                 Save {formatCurrency(savingsVsWorst, currency)} vs others
@@ -295,6 +373,24 @@ export function RateTable({
                         />
                       </div>
                     </td>
+                    <td className="px-4 py-3 text-right">
+                      {rate.reputationRank != null ? (
+                        <span
+                          title={`Reputation score: ${((rate.reputationScore ?? 0) * 100).toFixed(1)}%`}
+                          className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${
+                            rate.reputationRank === 1
+                              ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300'
+                              : rate.reputationRank <= 3
+                                ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300'
+                                : 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-300'
+                          }`}
+                        >
+                          #{rate.reputationRank}
+                        </span>
+                      ) : (
+                        <span className="text-secondary-text">—</span>
+                      )}
+                    </td>
                     <td className="px-4 py-3 text-right text-gray-700 dark:text-gray-300">
                       {rate.fee !== null ? formatCurrency(rate.fee, 'USD') : '—'}
                     </td>
@@ -302,6 +398,31 @@ export function RateTable({
                       {rate.exchangeRate !== null && rate.exchangeRate > 0
                         ? formatRate(rate.exchangeRate, 'USDC', currency)
                         : '—'}
+                      {(() => {
+                        const series = rateHistory[`${rate.corridorId}:${rate.anchorId}`];
+                        const trend = describeRateTrend(series);
+                        // The wrapper holds its height whether or not a chart is
+                        // inside it, so rows do not jump when the second data
+                        // point arrives a refresh later.
+                        return (
+                          <div
+                            className="mt-1 flex h-4 justify-end"
+                            data-testid={`rate-sparkline-${rate.anchorId}`}
+                          >
+                            {trend && (
+                              <>
+                                <Sparkline
+                                  data={series!}
+                                  width={64}
+                                  height={16}
+                                  className="text-accent"
+                                />
+                                <span className="sr-only">{trend}</span>
+                              </>
+                            )}
+                          </div>
+                        );
+                      })()}
                     </td>
                     <td className="px-4 py-3 text-right font-medium text-gray-900 dark:text-white">
                       {rate.totalReceived !== null
@@ -314,7 +435,7 @@ export function RateTable({
                           onClick={() => setExpandedAnchorId(isExpanded ? null : rate.anchorId)}
                           aria-label={isExpanded ? 'Hide details' : 'Show details'}
                           aria-expanded={isExpanded}
-                          className="rounded p-1 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200"
+                          className="rounded p-1 text-secondary-text hover:text-gray-600 dark:hover:text-gray-200"
                         >
                           <svg
                             className={`h-4 w-4 transition-transform ${isExpanded ? 'rotate-180' : ''}`}
@@ -337,7 +458,7 @@ export function RateTable({
                       </div>
                     </td>
                   </tr>
-                  {isExpanded && <RateRowDetail rate={rate} currency={currency} colSpan={5} />}
+                  {isExpanded && <RateRowDetail rate={rate} currency={currency} colSpan={6} />}
                 </Fragment>
               );
             })}
@@ -357,16 +478,20 @@ export function RateTable({
                       anchorId={anchorError.anchorId}
                       anchorName={anchorError.anchorName}
                     />
-                    <span className="font-medium text-gray-400 dark:text-gray-500">
+                    <span className="font-medium text-secondary-text">
                       {anchorError.anchorName}
                     </span>
                     <QuotePill source="unavailable" />
                   </div>
                 </td>
-                <td className="px-4 py-3 text-right text-gray-400 dark:text-gray-500">—</td>
-                <td className="px-4 py-3 text-right text-gray-400 dark:text-gray-500">—</td>
-                <td className="px-4 py-3 text-right text-gray-400 dark:text-gray-500">—</td>
+                <td className="px-4 py-3 text-right text-secondary-text">—</td>
+                <td className="px-4 py-3 text-right text-secondary-text">—</td>
+                <td className="px-4 py-3 text-right text-secondary-text">—</td>
+                <td className="px-4 py-3 text-right text-secondary-text">—</td>
                 <td className="px-4 py-3 text-right">
+                  {/* Greyed on purpose: disabled controls are exempt from the 4.5:1
+                      requirement (WCAG 1.4.3), and meeting it here would make an
+                      unavailable action look actionable (#755). */}
                   <button
                     disabled
                     aria-disabled="true"
@@ -400,6 +525,7 @@ export function RateTable({
                     </span>
                   </div>
                 </td>
+                <td className="px-4 py-3 text-right text-gray-700 dark:text-gray-300">—</td>
                 <td className="px-4 py-3 text-right text-gray-700 dark:text-gray-300">—</td>
                 <td className="px-4 py-3 text-right text-gray-700 dark:text-gray-300">—</td>
                 <td className="px-4 py-3 text-right font-medium text-gray-900 dark:text-white">

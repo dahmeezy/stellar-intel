@@ -4,11 +4,10 @@ use reputation::{ReputationContract, ReputationContractClient};
 use soroban_sdk::{testutils::Address as _, Address, Env, String};
 
 fn setup(env: &Env) -> (ReputationContractClient<'_>, Address, Address) {
-    let contract_id = env.register(ReputationContract, ());
-    let client = ReputationContractClient::new(env, &contract_id);
     let admin = Address::generate(env);
+    let contract_id = env.register(ReputationContract, (admin.clone(), admin.clone()));
+    let client = ReputationContractClient::new(env, &contract_id);
     let publisher = Address::generate(env);
-    client.init(&admin);
     client.add_publisher(&admin, &publisher);
     (client, admin, publisher)
 }
@@ -60,9 +59,30 @@ fn corridors_are_isolated_within_same_anchor() {
     let ngn = String::from_str(&env, "usdc-ngn");
     let kes = String::from_str(&env, "usdc-kes");
 
-    client.submit_outcome(&publisher, &anchor, &ngn, &String::from_str(&env, "h-ngn"), &20, &true);
-    client.submit_outcome(&publisher, &anchor, &kes, &String::from_str(&env, "h-kes-1"), &40, &false);
-    client.submit_outcome(&publisher, &anchor, &kes, &String::from_str(&env, "h-kes-2"), &80, &true);
+    client.submit_outcome(
+        &publisher,
+        &anchor,
+        &ngn,
+        &String::from_str(&env, "h-ngn"),
+        &20,
+        &true,
+    );
+    client.submit_outcome(
+        &publisher,
+        &anchor,
+        &kes,
+        &String::from_str(&env, "h-kes-1"),
+        &40,
+        &false,
+    );
+    client.submit_outcome(
+        &publisher,
+        &anchor,
+        &kes,
+        &String::from_str(&env, "h-kes-2"),
+        &80,
+        &true,
+    );
 
     let (ngn_total, ngn_success, ngn_sum) = client.get_corridor_aggregate(&anchor, &ngn);
     assert_eq!(ngn_total, 1);
@@ -85,9 +105,30 @@ fn same_corridor_across_different_anchors_is_isolated() {
     let anchor_b = String::from_str(&env, "bitso");
     let corridor = String::from_str(&env, "usdc-ngn");
 
-    client.submit_outcome(&publisher, &anchor_a, &corridor, &String::from_str(&env, "h-a"), &10, &true);
-    client.submit_outcome(&publisher, &anchor_b, &corridor, &String::from_str(&env, "h-b1"), &20, &false);
-    client.submit_outcome(&publisher, &anchor_b, &corridor, &String::from_str(&env, "h-b2"), &30, &true);
+    client.submit_outcome(
+        &publisher,
+        &anchor_a,
+        &corridor,
+        &String::from_str(&env, "h-a"),
+        &10,
+        &true,
+    );
+    client.submit_outcome(
+        &publisher,
+        &anchor_b,
+        &corridor,
+        &String::from_str(&env, "h-b1"),
+        &20,
+        &false,
+    );
+    client.submit_outcome(
+        &publisher,
+        &anchor_b,
+        &corridor,
+        &String::from_str(&env, "h-b2"),
+        &30,
+        &true,
+    );
 
     let (a_total, a_success, a_sum) = client.get_corridor_aggregate(&anchor_a, &corridor);
     assert_eq!(a_total, 1);
