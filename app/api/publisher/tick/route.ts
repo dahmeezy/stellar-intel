@@ -10,6 +10,8 @@ import {
   type ProbeCoverageSummary,
 } from '@stellarintel/publisher';
 import { withLoggerContext } from '@/lib/logger';
+import { checkCronAuth } from '@/lib/api/cron-auth';
+import { checkDurableStore } from '@/lib/api/store-guard';
 import { acquireLock, releaseLock } from '@/lib/reputation/lock';
 import { recordPublisherError, recordPublisherRun } from '@/lib/metrics';
 import { getPool } from '@/lib/reputation/pool';
@@ -114,12 +116,19 @@ async function tick(): Promise<BatchResult> {
 }
 
 export async function GET(request: NextRequest): Promise<NextResponse> {
-  const auth = request.headers.get('authorization');
-  if (auth !== `Bearer ${process.env.CRON_SECRET}`) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
-  }
+  const unauthorized = checkCronAuth(request);
+  if (unauthorized) return unauthorized;
 
   return withLoggerContext('api.publisher.tick', async (logger) => {
+    // The batch reads pending rows through the shared pool, so with no
+    // `DATABASE_URL` there is nothing to publish and nothing to record. Say so
+    // rather than reporting a generic tick failure.
+    const unavailable = checkDurableStore();
+    if (unavailable) {
+      logger.warn({ event: 'publisher_tick_store_unavailable' });
+      return unavailable;
+    }
+
     if (!(await acquireLock(LOCK_KEY, LOCK_TTL_MS))) {
       logger.warn({ event: 'publisher_tick_conflict' });
       return NextResponse.json({ error: 'Publisher tick already in progress' }, { status: 409 });
