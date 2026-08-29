@@ -3,9 +3,11 @@ import { z } from 'zod';
 import { ANCHORS, CORRIDORS } from '@/constants';
 import { withRequestLogger } from '@/lib/logger';
 import { buildScorecards, mapOutcomeRows } from '@/lib/reputation/aggregate';
-import { getReputationStore } from '@/lib/reputation/store';
+import { tryGetReputationStore } from '@/lib/reputation/store';
 import { getScoreForCorridor, type CorridorScore } from '@/lib/oracle/read';
 import type { ApiError } from '@/types';
+import { enforceRateLimit } from '@/lib/api/response';
+import { weightedComposite } from '@/lib/reputation/composite';
 
 // ─── Query param schema ────────────────────────────────────────────────────────
 
@@ -47,42 +49,21 @@ export interface LeaderboardResponse {
  *
  * All terms are clamped to [0, 1] before weighting.
  */
-function computeComposite(fill_rate: number, settle_p50: number, slippage_p50: number): number {
-  const fillScore = Math.min(1, Math.max(0, fill_rate));
-  const slippageScore = Math.min(1, Math.max(0, 1 - slippage_p50 / 0.05));
-  const settleScore = Math.min(1, Math.max(0, 1 - settle_p50 / 300));
-
-  const raw = 0.4 * fillScore + 0.3 * slippageScore + 0.3 * settleScore;
-  // Round to 4 decimal places to keep the payload compact
-  return Math.round(raw * 10_000) / 10_000;
-}
-
 async function buildLeaderboard(corridorFilter: string | undefined): Promise<LeaderboardEntry[]> {
   const anchors =
     corridorFilter !== undefined
       ? ANCHORS.filter((a) => a.corridors.includes(corridorFilter))
       : ANCHORS;
 
-  const store = getReputationStore();
+  // Null when no durable store is configured (local/dev without DATABASE_URL):
+  // every anchor degrades to an empty — not fake — scorecard rather than the
+  // whole leaderboard failing. This used to be attempted around `store.query`
+  // below, which could never work, because construction throws first.
+  const store = tryGetReputationStore();
 
   const entries = await Promise.all(
     anchors.map(async (anchor): Promise<LeaderboardEntry> => {
-      let rows: Awaited<ReturnType<typeof store.query>> = [];
-      try {
-        rows = await store.query({ anchorId: anchor.id });
-      } catch (error) {
-        // Postgres backend without an executor wired (local/dev without
-        // DATABASE_URL) — degrade to an empty (not fake) scorecard rather
-        // than failing the whole leaderboard.
-        if (
-          !(
-            error instanceof Error &&
-            error.message.includes('The postgres backend requires a SqlExecutor')
-          )
-        ) {
-          throw error;
-        }
-      }
+      const rows = store ? await store.query({ anchorId: anchor.id }) : [];
 
       const scorecard = buildScorecards(mapOutcomeRows(rows))[30];
       const fill_rate = scorecard.state === 'ok' ? scorecard.fillRate : 0;
@@ -94,7 +75,7 @@ async function buildLeaderboard(corridorFilter: string | undefined): Promise<Lea
       // honestly at the bottom rather than let zeroed inputs read as "perfect"
       // through the composite formula.
       const composite =
-        scorecard.state === 'ok' ? computeComposite(fill_rate, settle_p50, slippage_p50) : 0;
+        scorecard.state === 'ok' ? weightedComposite(fill_rate, settle_p50, slippage_p50) : 0;
 
       let onChain: CorridorScore | null = null;
       if (corridorFilter !== undefined) {
@@ -133,6 +114,12 @@ function etagFor(corridor: string | undefined, leaderboard: LeaderboardEntry[]):
 
 export async function GET(request: NextRequest): Promise<NextResponse> {
   return withRequestLogger(request, 'api.reputation.leaderboard', async (logger) => {
+    const limited = await enforceRateLimit(request, {
+      bucket: 'api.reputation.leaderboard',
+      maxRequests: 120,
+    });
+    if (limited) return limited;
+
     const { searchParams } = request.nextUrl;
 
     const rawParams = {

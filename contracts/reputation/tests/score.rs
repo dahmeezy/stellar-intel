@@ -6,13 +6,17 @@ use soroban_sdk::{testutils::Address as _, Address, Env, String};
 const MAX_BPS: i128 = 10000;
 
 fn setup(env: &Env) -> (ReputationContractClient<'_>, Address) {
-    let contract_id = env.register(ReputationContract, ());
-    let client = ReputationContractClient::new(env, &contract_id);
     let admin = Address::generate(env);
+    let contract_id = env.register(ReputationContract, (admin.clone(), admin.clone()));
+    let client = ReputationContractClient::new(env, &contract_id);
     (client, admin)
 }
 
-fn expected_composite_bps(fill_rate_bps: i128, slippage_bps: i128, settle_seconds_p50: u64) -> i128 {
+fn expected_composite_bps(
+    fill_rate_bps: i128,
+    slippage_bps: i128,
+    settle_seconds_p50: u64,
+) -> i128 {
     let fill_rate_bps = fill_rate_bps.clamp(0, MAX_BPS);
     let slippage_bps = slippage_bps.clamp(0, MAX_BPS);
     let settle_seconds = settle_seconds_p50.max(1) as i128;
@@ -31,8 +35,7 @@ fn expected_composite_bps(fill_rate_bps: i128, slippage_bps: i128, settle_second
 fn test_get_score_for_corridor_returns_default_for_missing_metrics() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, admin) = setup(&env);
-    client.init(&admin);
+    let (client, _admin) = setup(&env);
 
     let anchor = String::from_str(&env, "anchor-bitso");
     let corridor = String::from_str(&env, "usdc-ngn");
@@ -51,12 +54,16 @@ fn test_get_score_for_corridor_reads_stored_metrics_and_computes_composite() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, admin) = setup(&env);
-    client.init(&admin);
+
+    let publisher = Address::generate(&env);
+    client.add_publisher(&admin, &publisher);
 
     let anchor = String::from_str(&env, "anchor-bitso");
     let corridor = String::from_str(&env, "usdc-ngn");
 
-    client.set_corridor_metrics(&anchor, &corridor, &9700i128, &110i128, &42u64, &1240u32);
+    client.set_corridor_metrics(
+        &publisher, &anchor, &corridor, &9700i128, &110i128, &42u64, &1240u32,
+    );
 
     let (composite_bps, fill_rate_bps, settle_seconds_p50, n) =
         client.get_score_for_corridor(&anchor, &corridor);
@@ -72,12 +79,16 @@ fn test_get_score_for_corridor_clamps_metrics() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, admin) = setup(&env);
-    client.init(&admin);
+
+    let publisher = Address::generate(&env);
+    client.add_publisher(&admin, &publisher);
 
     let anchor = String::from_str(&env, "anchor-anclax");
     let corridor = String::from_str(&env, "usdc-kes");
 
-    client.set_corridor_metrics(&anchor, &corridor, &11000i128, &-100i128, &0u64, &33u32);
+    client.set_corridor_metrics(
+        &publisher, &anchor, &corridor, &11000i128, &-100i128, &0u64, &33u32,
+    );
 
     let (composite_bps, fill_rate_bps, settle_seconds_p50, n) =
         client.get_score_for_corridor(&anchor, &corridor);

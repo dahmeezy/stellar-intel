@@ -52,6 +52,7 @@ const BASE_CONFIG: BatchConfig = {
 // to reject once and then succeed) while the default keeps the happy path.
 const sdkMocks = vi.hoisted(() => ({
   submitOutcome: vi.fn(),
+  publishCorridorRate: vi.fn(),
   signAndSend: vi.fn(),
 }));
 
@@ -61,7 +62,12 @@ vi.mock('@stellar/stellar-sdk', () => ({
   },
   contract: {
     basicNodeSigner: vi.fn().mockReturnValue({ signTransaction: vi.fn() }),
-    Client: { from: vi.fn().mockResolvedValue({ submit_outcome: sdkMocks.submitOutcome }) },
+    Client: {
+      from: vi.fn().mockResolvedValue({
+        submit_outcome: sdkMocks.submitOutcome,
+        publish_corridor_rate: sdkMocks.publishCorridorRate,
+      }),
+    },
   },
 }));
 
@@ -70,6 +76,7 @@ beforeEach(() => {
     sendTransactionResponse: { hash: 'mock-tx-hash' },
   });
   sdkMocks.submitOutcome.mockReset().mockResolvedValue({ signAndSend: sdkMocks.signAndSend });
+  sdkMocks.publishCorridorRate.mockReset().mockResolvedValue({ signAndSend: sdkMocks.signAndSend });
 });
 
 describe('buildOutcomeHash', () => {
@@ -110,20 +117,21 @@ describe('fetchPendingOutcomes', () => {
 });
 
 describe('markPublished', () => {
-  it('does nothing when intentHashes is empty', async () => {
+  it('stamps a single row with its own tx hash', async () => {
     const executor = makeExecutor([]);
-    await markPublished(executor, [], 'some-tx-hash');
-    expect(executor).not.toHaveBeenCalled();
-  });
-
-  it('calls executor with correct placeholders', async () => {
-    const executor = makeExecutor([]);
-    await markPublished(executor, ['hash1', 'hash2'], 'tx-abc');
-    expect(executor).toHaveBeenCalledWith(expect.stringContaining('$2, $3'), [
+    await markPublished(executor, 'hash1', 'tx-abc');
+    expect(executor).toHaveBeenCalledWith(expect.stringContaining('intent_hash = $2'), [
       'tx-abc',
       'hash1',
-      'hash2',
     ]);
+  });
+
+  it('never writes one hash across several rows', async () => {
+    // Regression guard for the shape of the bug, not just an instance of it:
+    // the old signature took an array and an `IN (...)` clause.
+    const executor = makeExecutor([]);
+    await markPublished(executor, 'hash1', 'tx-abc');
+    expect(executor).toHaveBeenCalledWith(expect.not.stringContaining('IN ('), expect.anything());
   });
 });
 
@@ -257,5 +265,283 @@ describe('submitToOracle retry wiring', () => {
 
     expect(sdkMocks.submitOutcome).toHaveBeenCalledTimes(1);
     expect(onAlert).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('runBatch crash safety (#909)', () => {
+  const THREE_ROWS: OutcomeRow[] = [
+    { ...SAMPLE_ROW, intentHash: 'row-1' },
+    { ...SAMPLE_ROW, intentHash: 'row-2' },
+    { ...SAMPLE_ROW, intentHash: 'row-3' },
+  ];
+
+  /** Executor that answers the SELECT with `rows` and records every UPDATE. */
+  function makeTrackingExecutor(rows: OutcomeRow[]) {
+    const updates: Array<{ intentHash: string; txHash: string }> = [];
+    const executor = vi.fn(async (sql: string, params?: unknown[]) => {
+      if (sql.includes('UPDATE outcome_log')) {
+        const [txHash, intentHash] = params as [string, string];
+        updates.push({ intentHash, txHash });
+        return { rows: [] };
+      }
+      return { rows: rows.map(dbRow) };
+    }) as unknown as QueryExecutor;
+    return { executor, updates };
+  }
+
+  it('stamps every row with its own transaction hash', async () => {
+    const { executor, updates } = makeTrackingExecutor(THREE_ROWS);
+    sdkMocks.signAndSend
+      .mockResolvedValueOnce({ sendTransactionResponse: { hash: 'tx-1' } })
+      .mockResolvedValueOnce({ sendTransactionResponse: { hash: 'tx-2' } })
+      .mockResolvedValueOnce({ sendTransactionResponse: { hash: 'tx-3' } });
+
+    const result = await runBatch({ ...BASE_CONFIG, executor });
+
+    // The bug: all three used to be stamped with the last hash, so two rows
+    // pointed at a transaction that did not carry them.
+    expect(updates).toEqual([
+      { intentHash: 'row-1', txHash: 'tx-1' },
+      { intentHash: 'row-2', txHash: 'tx-2' },
+      { intentHash: 'row-3', txHash: 'tx-3' },
+    ]);
+    expect(result.submitted).toBe(3);
+  });
+
+  it('keeps the rows that landed marked when a later row fails', async () => {
+    const { executor, updates } = makeTrackingExecutor(THREE_ROWS);
+    sdkMocks.signAndSend
+      .mockResolvedValueOnce({ sendTransactionResponse: { hash: 'tx-1' } })
+      .mockResolvedValueOnce({ sendTransactionResponse: { hash: 'tx-2' } })
+      .mockRejectedValue(new Error('HostError: contract logic rejected'));
+
+    await expect(runBatch({ ...BASE_CONFIG, executor })).rejects.toThrow('contract logic');
+
+    // The bug: a throw anywhere left *zero* rows marked, so the next tick
+    // resubmitted rows 1 and 2 that were already on-chain.
+    expect(updates).toEqual([
+      { intentHash: 'row-1', txHash: 'tx-1' },
+      { intentHash: 'row-2', txHash: 'tx-2' },
+    ]);
+  });
+
+  it('refuses to mark a row when the send reports no hash', async () => {
+    const { executor, updates } = makeTrackingExecutor([THREE_ROWS[0]!]);
+    sdkMocks.signAndSend.mockResolvedValue({});
+
+    await expect(runBatch({ ...BASE_CONFIG, executor })).rejects.toThrow(
+      'no transaction hash returned'
+    );
+
+    // Marking it would strand the row: never republished, no usable tx hash.
+    expect(updates).toEqual([]);
+  });
+});
+
+// ─── Publish gate (#786) ──────────────────────────────────────────────────────
+
+describe('runBatch — publish gate', () => {
+  const GATED_ROWS: OutcomeRow[] = [
+    { ...SAMPLE_ROW, intentHash: 'gate-1' },
+    { ...SAMPLE_ROW, intentHash: 'gate-2' },
+  ];
+
+  const SHORT_COVERAGE = {
+    fleetThresholdMet: false,
+    thresholdDays: 90,
+    anchors: [{ anchorId: 'cowrie', continuousDays: 4, thresholdMet: false }],
+  };
+
+  const MET_COVERAGE = {
+    fleetThresholdMet: true,
+    thresholdDays: 90,
+    anchors: [{ anchorId: 'cowrie', continuousDays: 91, thresholdMet: true }],
+  };
+
+  it('withholds every row and writes nothing when the gate blocks', async () => {
+    const executor = makeExecutor(GATED_ROWS.map(dbRow));
+
+    const result = await runBatch({
+      ...BASE_CONFIG,
+      executor,
+      gate: {
+        network: 'mainnet',
+        loadCoverage: async () => SHORT_COVERAGE,
+        overrideEnabled: false,
+      },
+    });
+
+    expect(result.submitted).toBe(0);
+    expect(result.skipped).toBe(2);
+    expect(result.txHash).toBeNull();
+    expect(result.gate?.allowed).toBe(false);
+    // The rows keep published_at NULL, so a later tick picks them up unchanged.
+    expect(sdkMocks.submitOutcome).not.toHaveBeenCalled();
+  });
+
+  it('alerts on a blocked publish', async () => {
+    const onAlert = vi.fn();
+
+    await runBatch({
+      ...BASE_CONFIG,
+      executor: makeExecutor(GATED_ROWS.map(dbRow)),
+      onAlert,
+      gate: {
+        network: 'mainnet',
+        loadCoverage: async () => null,
+        overrideEnabled: false,
+      },
+    });
+
+    expect(onAlert).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: 'publish_gate_blocked', attempts: 0 })
+    );
+  });
+
+  it('publishes when coverage is met', async () => {
+    const { executor, updates } = makeTrackingExecutorForGate(GATED_ROWS);
+    sdkMocks.signAndSend
+      .mockResolvedValueOnce({ sendTransactionResponse: { hash: 'tx-a' } })
+      .mockResolvedValueOnce({ sendTransactionResponse: { hash: 'tx-b' } });
+
+    const result = await runBatch({
+      ...BASE_CONFIG,
+      executor,
+      gate: {
+        network: 'mainnet',
+        loadCoverage: async () => MET_COVERAGE,
+        overrideEnabled: false,
+      },
+    });
+
+    expect(result.submitted).toBe(2);
+    expect(result.gate?.allowed).toBe(true);
+    expect(updates).toHaveLength(2);
+  });
+
+  it('never consults coverage when there is nothing to publish', async () => {
+    const loadCoverage = vi.fn(async () => MET_COVERAGE);
+
+    const result = await runBatch({
+      ...BASE_CONFIG,
+      executor: makeExecutor([]),
+      gate: { network: 'mainnet', loadCoverage, overrideEnabled: false },
+    });
+
+    expect(result.submitted).toBe(0);
+    // An empty queue is not a publish, so it should not pay for a coverage query.
+    expect(loadCoverage).not.toHaveBeenCalled();
+    expect(result.gate).toBeUndefined();
+  });
+
+  it('behaves exactly as before when no gate is configured', async () => {
+    const { executor, updates } = makeTrackingExecutorForGate([GATED_ROWS[0]!]);
+    sdkMocks.signAndSend.mockResolvedValueOnce({ sendTransactionResponse: { hash: 'tx-z' } });
+
+    const result = await runBatch({ ...BASE_CONFIG, executor });
+
+    expect(result.submitted).toBe(1);
+    expect(result.gate).toBeUndefined();
+    expect(updates).toHaveLength(1);
+  });
+
+  function makeTrackingExecutorForGate(rows: OutcomeRow[]) {
+    const updates: Array<{ intentHash: string; txHash: string }> = [];
+    const executor = vi.fn(async (sql: string, params?: unknown[]) => {
+      if (sql.includes('UPDATE outcome_log')) {
+        const [txHash, intentHash] = params as [string, string];
+        updates.push({ intentHash, txHash });
+        return { rows: [] };
+      }
+      return { rows: rows.map(dbRow) };
+    }) as unknown as QueryExecutor;
+    return { executor, updates };
+  }
+});
+
+// ─── Corridor rates (#961) ────────────────────────────────────────────────────
+
+describe('runBatch — corridor rates', () => {
+  const RATE_ROWS: OutcomeRow[] = [{ ...SAMPLE_ROW, intentHash: 'rate-1' }];
+
+  const RATES = [
+    { corridor: 'usdc-ngn', rate: 15_800_000_000n, decimals: 7, sampleCount: 12 },
+    { corridor: 'usdc-kes', rate: 1_290_000_000n, decimals: 7, sampleCount: 4 },
+  ];
+
+  function trackingExecutor(rows: OutcomeRow[]) {
+    const executor = vi.fn(async (sql: string) => {
+      if (sql.includes('UPDATE outcome_log')) return { rows: [] };
+      return { rows: rows.map(dbRow) };
+    }) as unknown as QueryExecutor;
+    return executor;
+  }
+
+  it('publishes a rate per corridor after the outcomes land', async () => {
+    sdkMocks.signAndSend.mockResolvedValue({ sendTransactionResponse: { hash: 'tx-r' } });
+
+    const result = await runBatch({
+      ...BASE_CONFIG,
+      executor: trackingExecutor(RATE_ROWS),
+      loadCorridorRates: async () => RATES,
+    });
+
+    expect(result.submitted).toBe(1);
+    expect(result.corridorRatesPublished).toBe(2);
+    expect(sdkMocks.publishCorridorRate).toHaveBeenCalledTimes(2);
+    expect(sdkMocks.publishCorridorRate).toHaveBeenCalledWith(
+      expect.objectContaining({ corridor: 'usdc-ngn', rate: 15_800_000_000n, decimals: 7 })
+    );
+  });
+
+  it('skips a corridor with no settled outcomes rather than publishing zero', async () => {
+    sdkMocks.signAndSend.mockResolvedValue({ sendTransactionResponse: { hash: 'tx-r' } });
+
+    const result = await runBatch({
+      ...BASE_CONFIG,
+      executor: trackingExecutor(RATE_ROWS),
+      loadCorridorRates: async () => [
+        { corridor: 'usdc-ngn', rate: 15_800_000_000n, decimals: 7, sampleCount: 3 },
+        // A zero here would read on-chain as "the rate is zero", not "unknown".
+        { corridor: 'usdc-mxn', rate: 0n, decimals: 7, sampleCount: 0 },
+      ],
+    });
+
+    expect(result.corridorRatesPublished).toBe(1);
+    expect(sdkMocks.publishCorridorRate).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not roll back published outcomes when a rate write fails', async () => {
+    const updates: string[] = [];
+    const executor = vi.fn(async (sql: string, params?: unknown[]) => {
+      if (sql.includes('UPDATE outcome_log')) {
+        updates.push((params as [string, string])[1]);
+        return { rows: [] };
+      }
+      return { rows: RATE_ROWS.map(dbRow) };
+    }) as unknown as QueryExecutor;
+
+    sdkMocks.signAndSend.mockResolvedValue({ sendTransactionResponse: { hash: 'tx-r' } });
+    sdkMocks.publishCorridorRate.mockRejectedValue(new Error('HostError: contract logic rejected'));
+
+    const result = await runBatch({
+      ...BASE_CONFIG,
+      executor,
+      loadCorridorRates: async () => RATES,
+    });
+
+    // The outcome is the durable thing; a rate is overwritten next tick.
+    expect(updates).toEqual(['rate-1']);
+    expect(result.submitted).toBe(1);
+    expect(result.corridorRatesPublished).toBe(0);
+  });
+
+  it('behaves exactly as before with no loadCorridorRates', async () => {
+    sdkMocks.signAndSend.mockResolvedValue({ sendTransactionResponse: { hash: 'tx-r' } });
+
+    const result = await runBatch({ ...BASE_CONFIG, executor: trackingExecutor(RATE_ROWS) });
+
+    expect(result.corridorRatesPublished).toBeUndefined();
+    expect(sdkMocks.publishCorridorRate).not.toHaveBeenCalled();
   });
 });

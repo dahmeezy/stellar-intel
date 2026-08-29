@@ -16,13 +16,10 @@ const FOOTER_COLUMNS = [
   {
     title: 'Docs',
     links: [
-      { href: `${REPO_URL}#readme`, label: 'Overview', external: true },
-      { href: `${REPO_URL}/blob/main/docs/FAQ.md`, label: 'FAQ', external: true },
-      {
-        href: `${REPO_URL}/blob/main/docs/ARCHITECTURE.md`,
-        label: 'Architecture',
-        external: true,
-      },
+      { href: '/docs', label: 'Developer Portal' },
+      { href: '/docs/quickstart', label: 'Quickstart' },
+      { href: '/docs/api', label: 'API Reference' },
+      { href: '/docs/sdks', label: 'SDKs' },
     ],
   },
   {
@@ -36,6 +33,10 @@ const FOOTER_COLUMNS = [
   {
     title: 'Legal',
     links: [
+      // First in the column, and an internal link: app/terms/page.tsx existed
+      // but nothing pointed at it, so the only way to reach the Terms was to
+      // type the URL (#740).
+      { href: '/terms', label: 'Terms' },
       { href: `${REPO_URL}/blob/main/LICENSE`, label: 'License', external: true },
       { href: `${REPO_URL}/blob/main/docs/NON_CUSTODY.md`, label: 'Non-custody', external: true },
       {

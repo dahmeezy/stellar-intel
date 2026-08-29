@@ -10,7 +10,7 @@ exports[`Hero > matches the visual snapshot with live rate + leaderboard data 1`
   >
     <svg
       aria-hidden="true"
-      class="lucide lucide-zap h-3.5 w-3.5"
+      class="lucide lucide-activity h-3.5 w-3.5"
       fill="none"
       height="24"
       stroke="currentColor"
@@ -22,49 +22,49 @@ exports[`Hero > matches the visual snapshot with live rate + leaderboard data 1`
       xmlns="http://www.w3.org/2000/svg"
     >
       <path
-        d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"
+        d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"
       />
     </svg>
-    Stellar Execution Layer
+    Anchor Health Monitor
   </div>
   <h1
     class="max-w-4xl text-4xl font-bold tracking-tight leading-tight text-primary-text dark:text-primary-text sm:text-5xl lg:text-6xl"
     id="hero-heading"
   >
-    The execution layer for
+    Health and reputation monitoring
     <br
       class="hidden sm:block"
     />
     <span
-      class="text-accent dark:text-accent"
+      class="bg-gradient-to-r from-accent to-accent-2 bg-clip-text text-transparent"
     >
-      stablecoin off-ramps.
+      for every Stellar anchor.
     </span>
   </h1>
   <p
     class="mx-auto max-w-2xl text-lg text-secondary-text dark:text-secondary-text sm:text-xl"
   >
-    Compare live SEP-38 quotes across every Stellar anchor, then settle a non-custodial USDC off-ramp to Nigeria, Kenya, Ghana, Mexico, and more — in a single signed intent.
+    Continuous uptime, quote-latency, and rate-drift probes across every integrated Stellar anchor, scored on real delivered outcomes — so you can see which anchors actually pay out before you route a dollar.
   </p>
   <div
     class="flex flex-wrap items-center justify-center gap-4 pt-2"
   >
     <a
-      href="/offramp"
-    >
-      Off-ramp now
-    </a>
-    <a
       href="/anchors"
     >
       View anchors
+    </a>
+    <a
+      href="/offramp"
+    >
+      Off-ramp now
     </a>
   </div>
   <div
     class="grid w-full max-w-4xl gap-4 pt-4 text-left sm:grid-cols-2"
   >
     <div
-      class="rounded-2xl border border-gray-200 p-6 dark:border-gray-700"
+      class="rounded-2xl border border-border p-6"
     >
       <div
         class="flex min-h-[184px] flex-col justify-between"
@@ -149,7 +149,7 @@ exports[`Hero > matches the visual snapshot with live rate + leaderboard data 1`
       </div>
     </div>
     <div
-      class="rounded-2xl border border-gray-200 p-6 dark:border-gray-700"
+      class="rounded-2xl border border-border p-6"
     >
       <div
         class="flex min-h-[184px] flex-col justify-between"
@@ -172,13 +172,13 @@ exports[`Hero > matches the visual snapshot with live rate + leaderboard data 1`
               xmlns="http://www.w3.org/2000/svg"
             >
               <path
-                d="M10 14.66v1.626a2 2 0 0 1-.976 1.696A5 5 0 0 0 7 21.978"
+                d="M10 14.66V17a1 1 0 0 1-1 1 2 2 0 0 0-2 2v2"
               />
               <path
-                d="M14 14.66v1.626a2 2 0 0 0 .976 1.696A5 5 0 0 1 17 21.978"
+                d="M14 14.66V17a1 1 0 0 0 1 1 2 2 0 0 1 2 2v2"
               />
               <path
-                d="M18 9h1.5a1 1 0 0 0 0-5H18"
+                d="M17.916 10H19.5A2.5 2.5 0 0 0 22 7.5V5a1 1 0 0 0-1-1h-3"
               />
               <path
                 d="M4 22h16"
@@ -187,7 +187,7 @@ exports[`Hero > matches the visual snapshot with live rate + leaderboard data 1`
                 d="M6 9a6 6 0 0 0 12 0V3a1 1 0 0 0-1-1H7a1 1 0 0 0-1 1z"
               />
               <path
-                d="M6 9H4.5a1 1 0 0 1 0-5H6"
+                d="M6.084 10H4.5A2.5 2.5 0 0 1 2 7.5V5a1 1 0 0 1 1-1h3"
               />
             </svg>
             Leaderboard teaser

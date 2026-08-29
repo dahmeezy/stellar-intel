@@ -1,4 +1,6 @@
 import { createHash } from 'crypto';
+import { evaluatePublishGate, type GateDecision, type ProbeCoverageSummary } from './gate';
+import type { StellarNetwork } from './network';
 
 export type QueryExecutor = (
   sql: string,
@@ -29,7 +31,7 @@ export const DEFAULT_RETRY_OPTIONS: RetryOptions = {
 };
 
 /** Why a publish attempt ultimately failed, for the alert sink. */
-export type PublishFailureReason = 'non_retryable' | 'retries_exhausted';
+export type PublishFailureReason = 'non_retryable' | 'retries_exhausted' | 'publish_gate_blocked';
 
 export interface PublishAlert {
   reason: PublishFailureReason;
@@ -60,6 +62,30 @@ export interface BatchConfig {
   retry?: Partial<RetryOptions>;
   /** Alert sink invoked on non-retryable failures and exhausted retries (#D014). */
   onAlert?: AlertHook;
+  /**
+   * Pre-publish probe-coverage gate (#786). Optional: omitting it publishes
+   * exactly as before, so existing callers and their fixtures are unaffected.
+   *
+   * `loadCoverage` is a thunk rather than a value so an empty queue never pays
+   * for a coverage query — it is only called once there is something to publish.
+   * Returning `null` from it means "could not determine", which the gate treats
+   * as a refusal on mainnet.
+   */
+  gate?: {
+    network: StellarNetwork;
+    loadCoverage: () => Promise<ProbeCoverageSummary | null>;
+    overrideEnabled: boolean;
+    contractId?: string | undefined;
+    testnetContractId?: string | undefined;
+  };
+  /**
+   * Corridor rates to publish after the outcome loop (#961). Optional: omit it
+   * and the batch behaves exactly as before.
+   *
+   * A thunk, so the derivation is not computed for a tick that publishes
+   * nothing — and so it can read the same rows the batch just wrote.
+   */
+  loadCorridorRates?: () => Promise<readonly CorridorRateInput[]>;
 }
 
 export const DEFAULT_BATCH_SIZE = 100;
@@ -78,6 +104,13 @@ export interface BatchResult {
   submitted: number;
   skipped: number;
   txHash: string | null;
+  /**
+   * The gate's verdict, present only when a gate was configured. When
+   * `allowed` is false, `skipped` carries the number of rows withheld.
+   */
+  gate?: GateDecision;
+  /** Corridor rates written on-chain this tick (#961). */
+  corridorRatesPublished?: number;
 }
 
 export async function fetchPendingOutcomes(
@@ -112,18 +145,25 @@ export async function fetchPendingOutcomes(
   }));
 }
 
+/**
+ * Stamps one row with the hash of the transaction that actually carried it.
+ *
+ * Deliberately single-row. This used to take an array and write one hash across
+ * all of them, which was wrong twice over: N-1 rows ended up pointing at another
+ * row's transaction (and `app/anchors/[id]` surfaces that hash to users), and a
+ * mid-batch failure left every row unmarked even though some were already
+ * on-chain — so the next tick resubmitted them.
+ */
 export async function markPublished(
   executor: QueryExecutor,
-  intentHashes: string[],
+  intentHash: string,
   txHash: string
 ): Promise<void> {
-  if (intentHashes.length === 0) return;
-  const placeholders = intentHashes.map((_, i) => `$${i + 2}`).join(', ');
   await executor(
     `UPDATE outcome_log
        SET published_at = NOW(), oracle_tx_hash = $1
-     WHERE intent_hash IN (${placeholders})`,
-    [txHash, ...intentHashes]
+     WHERE intent_hash = $2`,
+    [txHash, intentHash]
   );
 }
 
@@ -279,6 +319,10 @@ export async function withRetry<T>(fn: () => Promise<T>, ctx: RetryContext = {})
   throw lastError;
 }
 
+type AssembledTx = Promise<{
+  signAndSend(): Promise<{ sendTransactionResponse?: { hash?: string } }>;
+}>;
+
 interface OracleSubmitClient {
   submit_outcome(args: {
     publisher: string;
@@ -287,15 +331,53 @@ interface OracleSubmitClient {
     outcome_hash: string;
     settle_seconds: bigint;
     success: boolean;
-  }): Promise<{ signAndSend(): Promise<{ sendTransactionResponse?: { hash?: string } }> }>;
+  }): AssembledTx;
+
+  /**
+   * Block-level corridor rate (#810, wired in #961).
+   *
+   * The contract entrypoint and `deriveAllCorridorRates` both shipped and were
+   * connected by nothing — the only caller of the derivation was its own test,
+   * so no rate has ever reached the chain.
+   */
+  publish_corridor_rate(args: {
+    publisher: string;
+    corridor: string;
+    rate: bigint;
+    decimals: number;
+  }): AssembledTx;
 }
+
+/**
+ * One corridor rate ready to publish.
+ *
+ * Structural, matching `CorridorRatePublish` from `lib/oracle/corridor-rate.ts`,
+ * for the same reason `ProbeCoverageSummary` is: this package is consumed by
+ * the app, so importing app types back into it would invert the dependency.
+ */
+export interface CorridorRateInput {
+  corridor: string;
+  /** Scaled by 10^`decimals`, fiat units per 1 USDC. */
+  rate: bigint;
+  decimals: number;
+  sampleCount: number;
+}
+
+/**
+ * Called after each row is confirmed on-chain, before the next is attempted.
+ *
+ * This is the crash-safety seam: persisting here means a failure at row k leaves
+ * rows 0..k-1 durably marked instead of losing the whole batch's bookkeeping.
+ */
+export type OnRowSubmitted = (intentHash: string, txHash: string) => Promise<void>;
 
 export async function submitToOracle(
   rows: OutcomeRow[],
   config: Pick<
     BatchConfig,
     'oracleContractId' | 'networkPassphrase' | 'publisherSecret' | 'rpcUrl' | 'retry' | 'onAlert'
-  >
+  >,
+  onRowSubmitted?: OnRowSubmitted
 ): Promise<string> {
   // Dynamic import: @stellar/stellar-sdk ships ESM-only types, and this
   // package builds as CommonJS — a static import would emit a require()
@@ -331,13 +413,83 @@ export async function submitToOracle(
       },
       { intentHash: row.intentHash, onAlert: config.onAlert, options: config.retry }
     );
-    txHash = sent.sendTransactionResponse?.hash ?? txHash;
+    const rowTxHash = sent.sendTransactionResponse?.hash ?? null;
+    if (rowTxHash === null) {
+      // A send that reports no hash is not a confirmed write; marking it
+      // published would strand the row as permanently unpublishable.
+      throw new Error(`submitToOracle: no transaction hash returned for ${row.intentHash}`);
+    }
+
+    await onRowSubmitted?.(row.intentHash, rowTxHash);
+    txHash = rowTxHash;
   }
 
   if (!txHash) {
     throw new Error('submitToOracle: no transaction was submitted');
   }
   return txHash;
+}
+
+/**
+ * Publishes block-level corridor rates (#961).
+ *
+ * A **second phase**, run after the outcome loop rather than interleaved with
+ * it: `submitToOracle` marks each row the moment its write confirms, and that
+ * crash-safety contract must not be disturbed by another write sharing the
+ * loop. A failure here therefore cannot un-mark an outcome that already landed.
+ *
+ * Returns the number of corridors written. Never throws — a rate is a
+ * best-effort refresh of a value that is overwritten on the next tick, and
+ * failing the whole batch over one would strand outcomes that did publish.
+ */
+export async function publishCorridorRates(
+  rates: readonly CorridorRateInput[],
+  config: Pick<
+    BatchConfig,
+    'oracleContractId' | 'networkPassphrase' | 'publisherSecret' | 'rpcUrl' | 'retry' | 'onAlert'
+  >
+): Promise<number> {
+  if (rates.length === 0) return 0;
+
+  const { contract, Keypair } = await import('@stellar/stellar-sdk');
+  const publisherKeypair = Keypair.fromSecret(config.publisherSecret);
+  const { signTransaction } = contract.basicNodeSigner(publisherKeypair, config.networkPassphrase);
+
+  const client = (await contract.Client.from({
+    contractId: config.oracleContractId,
+    rpcUrl: config.rpcUrl,
+    networkPassphrase: config.networkPassphrase,
+    publicKey: publisherKeypair.publicKey(),
+    signTransaction,
+  })) as unknown as OracleSubmitClient;
+
+  let published = 0;
+  for (const rate of rates) {
+    // A corridor with no settled outcomes has no derivable rate. Skipping is
+    // right; publishing a zero would read as "the rate is zero".
+    if (rate.sampleCount === 0) continue;
+
+    try {
+      const assembled = await withRetry(
+        async () => {
+          const tx = await client.publish_corridor_rate({
+            publisher: publisherKeypair.publicKey(),
+            corridor: rate.corridor,
+            rate: rate.rate,
+            decimals: rate.decimals,
+          });
+          return tx.signAndSend();
+        },
+        { onAlert: config.onAlert, options: config.retry }
+      );
+      if (assembled.sendTransactionResponse?.hash) published += 1;
+    } catch {
+      // withRetry has already alerted. Keep going: one unwritable corridor
+      // should not stop the others.
+    }
+  }
+
+  return published;
 }
 
 export async function runBatch(config: BatchConfig): Promise<BatchResult> {
@@ -347,12 +499,64 @@ export async function runBatch(config: BatchConfig): Promise<BatchResult> {
     return { submitted: 0, skipped: 0, txHash: null };
   }
 
-  const txHash = await submitToOracle(rows, config);
-  await markPublished(
-    config.executor,
-    rows.map((r) => r.intentHash),
-    txHash
-  );
+  // Gate after the fetch, not before: an empty queue is not a publish, so it
+  // should not spend a coverage query or produce a gate verdict. Withheld rows
+  // keep published_at NULL and are simply picked up by a later tick.
+  let gateDecision: GateDecision | undefined;
+  if (config.gate) {
+    const coverage = await config.gate.loadCoverage();
+    const decision = evaluatePublishGate({
+      network: config.gate.network,
+      coverage,
+      overrideEnabled: config.gate.overrideEnabled,
+      contractId: config.gate.contractId,
+      testnetContractId: config.gate.testnetContractId,
+    });
 
-  return { submitted: rows.length, skipped: 0, txHash };
+    if (!decision.allowed) {
+      await config.onAlert?.({
+        reason: 'publish_gate_blocked',
+        error: new Error(decision.message),
+        attempts: 0,
+      });
+      return { submitted: 0, skipped: rows.length, txHash: null, gate: decision };
+    }
+
+    gateDecision = decision;
+
+    if (decision.reason === 'override') {
+      // error, not warn: an override is a human deciding to publish against an
+      // unverified probe history, and it should reach whatever watches errors.
+      // eslint-disable-next-line no-console
+      console.error(
+        '[publisher] publish_gate_overridden — PUBLISH_GATE_OVERRIDE=true bypassed the ' +
+          `${config.gate.network} probe-coverage gate for ${rows.length} row(s)`
+      );
+    }
+  }
+
+  let submitted = 0;
+  const txHash = await submitToOracle(rows, config, async (intentHash, rowTxHash) => {
+    await markPublished(config.executor, intentHash, rowTxHash);
+    submitted += 1;
+  });
+
+  // `submitted` counts rows actually marked, not rows attempted. If this throws
+  // partway the count never reaches rows.length, and the rows that did land stay
+  // marked — the next tick picks up only the remainder.
+  // Second phase, after every outcome is marked. See publishCorridorRates for
+  // why it is not interleaved with the loop above.
+  let corridorRatesPublished: number | undefined;
+  if (config.loadCorridorRates) {
+    const rates = await config.loadCorridorRates();
+    corridorRatesPublished = await publishCorridorRates(rates, config);
+  }
+
+  return {
+    submitted,
+    skipped: rows.length - submitted,
+    txHash,
+    ...(gateDecision ? { gate: gateDecision } : {}),
+    ...(corridorRatesPublished !== undefined ? { corridorRatesPublished } : {}),
+  };
 }

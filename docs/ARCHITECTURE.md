@@ -240,7 +240,7 @@ Implemented in `lib/stellar/sep10.ts`. Key invariants:
 | `signing`        | Freighter            | User signs the payment XDR.                                                                                     | User-reject returns to idle; signature-required errors surface.         |
 | `done`           | —                    | Drawer closes; `onSuccess` hoists `{ transactionId, transferServer, jwt }` to the page; `StatusTracker` mounts. | Terminal.                                                               |
 
-**The `done` hoist is the fix for credibility bug #2** (see `PROPOSAL.md § 5`).
+**The `done` hoist is the fix for the tracker-never-mounts bug (#002).**
 Before `commit 45a82eb` the drawer completed the withdrawal but never told the
 page; after, the drawer closes on success and the tracker owns the viewport
 with a live `transactionId`.
@@ -459,10 +459,13 @@ pub fn get_admin(env: &Env) -> Option<Address>;
 
 Two client libraries ship alongside the contract:
 
-- `contracts/reputation/sdk-rs/` — Rust consumer for other Soroban contracts
-  (`read_aggregate` helper, typed structs). _(planned)_
+- [`crates/stellar-intel-reputation/`](../crates/stellar-intel-reputation/) —
+  Rust consumer for other Soroban contracts (`read_aggregate`/`corridor_score`/
+  `corridor_aggregate` helpers, typed structs). Publish-ready (`publish = true`,
+  full crates.io metadata); the actual `cargo publish` awaits a maintainer
+  adding a `CARGO_REGISTRY_TOKEN` secret (`.github/workflows/publish-rust-sdk.yml`).
 - `packages/sdk/oracle.ts` — TypeScript consumer for off-chain readers
-  (wallets, rival aggregators, dashboards).
+  (wallets, rival aggregators, dashboards). _(planned)_
 
 ---
 
@@ -551,6 +554,7 @@ stellar-intel/
 │   └── useTheme.ts                # ✅
 ├── lib/
 │   ├── config.ts                  # ✅ env-guarded config
+│   ├── analytics.ts               # ✅ funnel event tracking + PII redaction
 │   ├── utils.ts                   # ✅ computeTotalReceived, format helpers
 │   └── stellar/
 │       ├── anchors.ts             # ✅ registry (MoneyGram, Cowrie, Anclap)
@@ -571,7 +575,8 @@ stellar-intel/
 ├── types/index.ts                 # ✅ Anchor, Corridor, AnchorRate, WithdrawStatus, …
 ├── tests/                         # ✅ vitest — anchors, SEP-1, SEP-10, status
 ├── docs/
-│   ├── PROPOSAL.md                # grant thesis
+│   ├── PROPOSAL.md                # project thesis
+│   ├── PRODUCTION_AUDIT.md        # what is enforced vs only documented
 │   ├── ARCHITECTURE.md            # this document
 │   ├── ROADMAP.md                 # wave-by-wave scope
 │   ├── INTENT_API.md              # intent schema + signing
@@ -582,7 +587,8 @@ stellar-intel/
 │   ├── THREAT_MODEL.md            # adversaries + mitigations
 │   ├── NON_CUSTODY.md             # custody manifesto
 │   ├── JURISDICTIONAL.md          # money-transmission memo
-│   └── SECURITY.md                # disclosure policy
+│   ├── SECURITY.md                # disclosure policy
+│   └── ANALYTICS.md               # funnel dashboard + event taxonomy
 └── .github/workflows/             # ✅ ci, codeql, lighthouse, data-health, …
 ```
 

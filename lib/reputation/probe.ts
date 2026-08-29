@@ -12,13 +12,22 @@
  */
 
 import { getLogger } from '@/lib/logger';
-import { resolveToml } from '@/lib/stellar/sep1';
+import { resolveToml, validateTomlIntegrity, type TomlResult } from '@/lib/stellar/sep1';
 import { getCorridorById } from '@/lib/stellar/anchors';
-import { assertSep38Capable, getSep38Price } from '@/lib/stellar/sep38';
-import { DRIFT_THRESHOLD_PERCENT, isDrifted } from './thresholds';
+import { assertSep38Capable, getSep38Price, getSep38Info } from '@/lib/stellar/sep38';
+import {
+  DEGRADE_AFTER_FAILURES,
+  DOWN_AFTER_FAILURES,
+  DRIFT_THRESHOLD_PERCENT,
+  LATENCY_BUDGET_MS,
+  healthStatusFor,
+  isDegradingTransition,
+  isDrifted,
+  type AnchorHealthStatus,
+} from './thresholds';
 import { ANCHORS } from '@/constants/anchors';
-import type { ProbeFailureType } from '@/types/reputation';
-import type { Anchor } from '@/types';
+import type { ProbeFailureType, ProbeKind, ProbeLedgerRow } from '@/types/reputation';
+import type { Anchor, Sep1TomlData } from '@/types';
 
 const logger = getLogger('reputation/probe');
 
@@ -630,4 +639,568 @@ export function quoteLatencyPercentiles(
     return sorted[Math.min(Math.max(idx, 0), sorted.length - 1)]!;
   };
   return { p50Ms: rank(50), p95Ms: rank(95), sampleCount: windowed.length };
+}
+
+// ─── Issuer-mismatch probe (Issue #D004) ───────────────────────────────────────
+//
+// Compares an anchor's stellar.toml advertised issuer for its registered asset
+// against the issuer its own live SEP-38 GET /info response returns for that
+// same asset. The two are usually set from the same config and never drift,
+// but if they ever do it means the anchor's live quote server is settling a
+// look-alike asset under a different issuer than the one publicly advertised
+// — a trust-critical signal distinct from routine unreachability, so it is
+// recorded as its own probe dimension rather than folded into `uptime`.
+
+/** Outcome of one issuer-mismatch check. */
+export interface IssuerCheckResult {
+  /** True when both the toml and the live SEP-38 /info issuer were resolved (whether or not they match). */
+  ok: boolean;
+  /** Issuer address from the anchor's stellar.toml CURRENCIES entry for its asset code; null if absent. */
+  advertisedIssuer: string | null;
+  /** Issuer address from the anchor's live SEP-38 /info assets list for the same asset code; null if absent. */
+  actualIssuer: string | null;
+  /** Set when `ok` is false — the reason the check could not complete. */
+  error?: string;
+}
+
+/** Injectable dependencies for the issuer-mismatch probe. */
+export interface IssuerMismatchDeps {
+  /** Resolves an anchor's advertised vs. actual issuer. Defaults to a real toml + SEP-38 /info fetch. */
+  checkIssuer?: (anchor: Anchor) => Promise<IssuerCheckResult>;
+  /** Monotonic-ish millisecond clock. Defaults to `Date.now`. */
+  now?: () => number;
+}
+
+async function defaultCheckIssuer(anchor: Anchor): Promise<IssuerCheckResult> {
+  const domain = anchor.serviceDomain ?? anchor.homeDomain;
+  const tomlResult = await resolveToml(domain);
+  if (!tomlResult.ok) {
+    return { ok: false, advertisedIssuer: null, actualIssuer: null, error: tomlResult.error };
+  }
+
+  const advertisedIssuer =
+    tomlResult.data.CURRENCIES.find((c) => c.code === anchor.assetCode)?.issuer ?? null;
+
+  let quoteServer: string;
+  try {
+    quoteServer = assertSep38Capable(tomlResult.data);
+  } catch (err) {
+    return {
+      ok: false,
+      advertisedIssuer,
+      actualIssuer: null,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+
+  try {
+    const info = await getSep38Info(quoteServer);
+    const prefix = `stellar:${anchor.assetCode}:`;
+    const match = info.assets.find((a) => a.asset.startsWith(prefix));
+    const actualIssuer = match ? match.asset.slice(prefix.length) || null : null;
+    return { ok: true, advertisedIssuer, actualIssuer };
+  } catch (err) {
+    return {
+      ok: false,
+      advertisedIssuer,
+      actualIssuer: null,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+function resolveIssuerMismatchDeps(deps?: IssuerMismatchDeps): Required<IssuerMismatchDeps> {
+  return {
+    checkIssuer: deps?.checkIssuer ?? defaultCheckIssuer,
+    now: deps?.now ?? Date.now,
+  };
+}
+
+/**
+ * Probe one anchor's issuer-mismatch check, recording exactly one sample.
+ * `reachable: true` means the check completed and the advertised and actual
+ * issuers matched; `reachable: false` covers both a genuine mismatch (a
+ * `mismatch` failure type, distinguishable from network failures) and a
+ * probe that could not complete (classified like the other probes).
+ */
+export async function probeIssuerMismatch(
+  anchor: Anchor,
+  store: ProbeSampleStore,
+  deps?: IssuerMismatchDeps
+): Promise<ProbeSample> {
+  const { checkIssuer, now } = resolveIssuerMismatchDeps(deps);
+  const domain = anchor.serviceDomain ?? anchor.homeDomain;
+  const start = now();
+
+  let result: IssuerCheckResult;
+  try {
+    result = await checkIssuer(anchor);
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    logger.warn({ event: 'probe.issuer.error', domain, error }, 'issuer probe caught an exception');
+    result = { ok: false, advertisedIssuer: null, actualIssuer: null, error };
+  }
+
+  let reachable: boolean;
+  let error: string | undefined;
+  let failureType: ProbeFailureType | null = null;
+  if (!result.ok) {
+    reachable = false;
+    error = result.error ?? 'issuer check unavailable';
+    failureType = classifyFailure(error);
+  } else if (result.advertisedIssuer !== null && result.advertisedIssuer === result.actualIssuer) {
+    reachable = true;
+  } else {
+    reachable = false;
+    failureType = 'mismatch';
+    error = `issuer mismatch for ${anchor.assetCode}: advertised=${result.advertisedIssuer ?? 'none'} actual=${result.actualIssuer ?? 'none'}`;
+  }
+
+  const end = now();
+  const sample: ProbeSample = {
+    domain,
+    reachable,
+    latencyMs: Math.max(0, end - start),
+    at: end,
+    failureType,
+    ...(error !== undefined ? { error } : {}),
+  };
+  logger.info(
+    { event: 'probe.issuer.sample', domain, reachable, failureType, error },
+    'issuer-mismatch sample recorded'
+  );
+  store.record(sample);
+  return sample;
+}
+
+/**
+ * Runs the issuer-mismatch probe for every registered anchor, concurrently.
+ * Defaults to the registered fleet in `constants/anchors.ts`; a different
+ * anchor list may be injected for tests.
+ */
+export async function probeAllAnchorIssuers(
+  store: ProbeSampleStore,
+  deps?: IssuerMismatchDeps,
+  anchors: readonly Anchor[] = ANCHORS
+): Promise<ProbeSample[]> {
+  logger.info(
+    { event: 'probe.issuer.all.start', anchorCount: anchors.length },
+    'starting issuer-mismatch probe run'
+  );
+  const samples = await Promise.all(
+    anchors.map((anchor) => probeIssuerMismatch(anchor, store, deps))
+  );
+  const mismatched = samples.filter((s) => s.failureType === 'mismatch').length;
+  logger.info(
+    { event: 'probe.issuer.all.complete', total: samples.length, mismatched },
+    'issuer-mismatch probe run complete'
+  );
+  return samples;
+}
+
+// ─── Toml-integrity probe (Issue #D003) ────────────────────────────────────────
+//
+// Validates each anchor's stellar.toml against the SEP-1 required-field
+// expectations (see `validateTomlIntegrity` in `lib/stellar/sep1`), flagging
+// a missing SIGNING_KEY, a malformed TRANSFER_SERVER*/URL, or drift vs. the
+// last known-good snapshot — none of which uptime alone would catch, since a
+// broken toml doesn't take the domain offline.
+
+/** Injectable dependencies for the toml-integrity probe. */
+export interface TomlIntegrityDeps {
+  /** Resolves an anchor's stellar.toml. Defaults to `resolveToml` from lib/stellar/sep1. */
+  fetchToml?: (domain: string) => Promise<TomlResult>;
+  /** Looks up the last known-good snapshot for a domain. Defaults to an in-memory, per-process map. */
+  getLastKnownGood?: (domain: string) => Sep1TomlData | null;
+  /** Records a validated-clean snapshot as the new last known-good. Defaults to the same in-memory map. */
+  recordLastKnownGood?: (domain: string, toml: Sep1TomlData) => void;
+  /** Monotonic-ish millisecond clock. Defaults to `Date.now`. */
+  now?: () => number;
+}
+
+const lastKnownGoodToml = new Map<string, Sep1TomlData>();
+
+function defaultGetLastKnownGood(domain: string): Sep1TomlData | null {
+  return lastKnownGoodToml.get(domain) ?? null;
+}
+
+function defaultRecordLastKnownGood(domain: string, toml: Sep1TomlData): void {
+  lastKnownGoodToml.set(domain, toml);
+}
+
+function resolveTomlIntegrityDeps(deps?: TomlIntegrityDeps): Required<TomlIntegrityDeps> {
+  return {
+    fetchToml: deps?.fetchToml ?? resolveToml,
+    getLastKnownGood: deps?.getLastKnownGood ?? defaultGetLastKnownGood,
+    recordLastKnownGood: deps?.recordLastKnownGood ?? defaultRecordLastKnownGood,
+    now: deps?.now ?? Date.now,
+  };
+}
+
+/**
+ * Probe one anchor's toml-integrity check, recording exactly one sample.
+ * `reachable: true` means the toml resolved and validated clean — the
+ * snapshot is then recorded as the new last known-good. `reachable: false`
+ * covers both a validation failure (an `integrity` failure type, distinguishable
+ * from network failures) and a probe that could not complete (classified like
+ * the other probes).
+ */
+export async function probeTomlIntegrity(
+  domain: string,
+  store: ProbeSampleStore,
+  deps?: TomlIntegrityDeps
+): Promise<ProbeSample> {
+  const { fetchToml, getLastKnownGood, recordLastKnownGood, now } = resolveTomlIntegrityDeps(deps);
+  const start = now();
+
+  let reachable: boolean;
+  let error: string | undefined;
+  let failureType: ProbeFailureType | null = null;
+
+  const result = await fetchToml(domain);
+  if (!result.ok) {
+    reachable = false;
+    error = result.error;
+    failureType = classifyFailure(error);
+  } else {
+    const previous = getLastKnownGood(domain);
+    const validation = validateTomlIntegrity(result.data, previous);
+    if (validation.valid) {
+      reachable = true;
+      recordLastKnownGood(domain, result.data);
+    } else {
+      reachable = false;
+      failureType = 'integrity';
+      error = validation.issues.map((issue) => `${issue.field}: ${issue.reason}`).join('; ');
+    }
+  }
+
+  const end = now();
+  const sample: ProbeSample = {
+    domain,
+    reachable,
+    latencyMs: Math.max(0, end - start),
+    at: end,
+    failureType,
+    ...(error !== undefined ? { error } : {}),
+  };
+  logger.info(
+    { event: 'probe.integrity.sample', domain, reachable, failureType, error },
+    'toml-integrity sample recorded'
+  );
+  store.record(sample);
+  return sample;
+}
+
+/**
+ * Runs the toml-integrity probe for every registered anchor, concurrently.
+ * Defaults to the registered fleet in `constants/anchors.ts`; a different
+ * anchor list may be injected for tests.
+ */
+export async function probeAllAnchorIntegrity(
+  store: ProbeSampleStore,
+  deps?: TomlIntegrityDeps,
+  anchors: readonly Anchor[] = ANCHORS
+): Promise<ProbeSample[]> {
+  logger.info(
+    { event: 'probe.integrity.all.start', anchorCount: anchors.length },
+    'starting toml-integrity probe run'
+  );
+  const samples = await Promise.all(
+    anchors.map((anchor) =>
+      probeTomlIntegrity(anchor.serviceDomain ?? anchor.homeDomain, store, deps)
+    )
+  );
+  const failed = samples.filter((s) => s.failureType === 'integrity').length;
+  logger.info(
+    { event: 'probe.integrity.all.complete', total: samples.length, failed },
+    'toml-integrity probe run complete'
+  );
+  return samples;
+}
+
+// ─── Durable persistence adapter (Issue #D007) ─────────────────────────────────
+//
+// `ProbeSampleStore` (used by every probe function above) is the in-memory
+// shape probes write to during a single run; it has no `kind`, since a probe
+// runner only ever produces one kind of sample. This adapter fans each
+// `record()` call out to a durable `ReputationStore`'s `recordProbeSample`,
+// tagging every row with the `kind` it was constructed for, so a scheduled
+// runner can point a probe function straight at the durable health ledger
+// instead of accumulating in memory and being discarded when the process exits.
+
+/** The minimal slice of `ReputationStore` this adapter depends on. */
+export interface ProbeLedgerSink {
+  recordProbeSample(row: ProbeLedgerRow): Promise<void>;
+}
+
+/**
+ * Adapts a durable `ReputationStore` to the `ProbeSampleStore` interface any
+ * probe function accepts, tagging every recorded sample with a fixed `kind`.
+ * `record()` fires the write without awaiting it — probe functions call it
+ * synchronously — so callers that need durability guarantees should `await`
+ * on the returned promises via `recordAll`/`flush` semantics elsewhere, or
+ * simply await the probe run and then `await drain()`.
+ */
+export class DurableProbeStore implements ProbeSampleStore {
+  private readonly pending: Promise<void>[] = [];
+  private persistedCount = 0;
+  private failedCount = 0;
+
+  constructor(
+    private readonly sink: ProbeLedgerSink,
+    private readonly kind: ProbeKind
+  ) {}
+
+  /** Samples this adapter has successfully written, as of the last `drain()`. */
+  get persisted(): number {
+    return this.persistedCount;
+  }
+
+  /**
+   * Samples whose write rejected. Non-zero means the run produced samples that
+   * never reached the ledger — a caller reporting success without checking this
+   * is reporting a probe run that accumulated nothing (Issue #906).
+   */
+  get failed(): number {
+    return this.failedCount;
+  }
+
+  record(sample: ProbeSample): void {
+    const row: ProbeLedgerRow = {
+      domain: sample.domain,
+      kind: this.kind,
+      corridor: sample.corridor ?? null,
+      reachable: sample.reachable,
+      latencyMs: sample.latencyMs,
+      failureType: sample.failureType ?? null,
+      error: sample.error ?? null,
+      probedAt: new Date(sample.at).toISOString(),
+    };
+    this.pending.push(
+      this.sink.recordProbeSample(row).then(
+        () => {
+          this.persistedCount += 1;
+        },
+        (err: unknown) => {
+          this.failedCount += 1;
+          logger.error(
+            { event: 'probe.persist.error', domain: row.domain, kind: row.kind, err },
+            'failed to persist probe sample to the durable store'
+          );
+        }
+      )
+    );
+  }
+
+  /** In-memory samples are not tracked by this adapter — it exists purely to persist. */
+  samples(): ProbeSample[] {
+    return [];
+  }
+
+  /** Awaits every write triggered by `record()` so far. */
+  async drain(): Promise<void> {
+    await Promise.all(this.pending.splice(0, this.pending.length));
+  }
+}
+
+// ─── Probe-failure alerting (Issue #D016) ──────────────────────────────────────
+//
+// The probes above each answer one question about an anchor; this turns their
+// per-cycle verdicts into a single composite health status and alerts when that
+// status degrades. The debounce is the same consecutive-failure rule the
+// nightly auto-degrade ledger uses (see `lib/reputation/thresholds.ts`), so one
+// flaky cycle never pages anyone and a latched status never re-alerts.
+
+/** The probe dimensions that feed an anchor's composite health status. */
+export const PROBE_DIMENSIONS = ['uptime', 'latency', 'drift'] as const;
+export type ProbeDimension = (typeof PROBE_DIMENSIONS)[number];
+
+/** One anchor's results from a single probe cycle. Every dimension is optional — a cycle that didn't run a probe can't fail it. */
+export interface ProbeCycle {
+  /** Uptime probe sample (`probeAnchor`). */
+  uptime?: ProbeSample | undefined;
+  /** Quote-latency samples for this anchor (`probeQuoteLatency`), one per corridor. */
+  latency?: readonly ProbeSample[] | undefined;
+  /** This anchor's row from the cycle's `detectQuoteDrift` comparison. */
+  drift?: DriftSample | undefined;
+}
+
+/**
+ * Which dimensions failed in one cycle: `uptime` when the stellar.toml probe
+ * was unreachable, `latency` when any quote sample was unreachable or busted
+ * the round-trip budget, `drift` when the anchor's quote was flagged
+ * off-median. Returned in `PROBE_DIMENSIONS` order so alert payloads are
+ * stable regardless of which probe reported first.
+ */
+export function failingDimensions(
+  cycle: ProbeCycle,
+  latencyBudgetMs: number = LATENCY_BUDGET_MS
+): ProbeDimension[] {
+  const failing = new Set<ProbeDimension>();
+  if (cycle.uptime && !cycle.uptime.reachable) failing.add('uptime');
+  for (const sample of cycle.latency ?? []) {
+    if (!sample.reachable || sample.latencyMs > latencyBudgetMs) failing.add('latency');
+  }
+  if (cycle.drift?.flagged) failing.add('drift');
+  return PROBE_DIMENSIONS.filter((d) => failing.has(d));
+}
+
+/** A composite health status crossing into a worse state. */
+export interface HealthAlert {
+  anchorId: string;
+  /** Status before this cycle. */
+  from: AnchorHealthStatus;
+  /** Status after this cycle; always strictly worse than `from`. */
+  to: AnchorHealthStatus;
+  /** Every dimension that failed at some point during the streak that tripped the transition, in `PROBE_DIMENSIONS` order. */
+  dimensions: ProbeDimension[];
+  /** Length of the consecutive-failure streak when the transition fired. */
+  consecutiveFailures: number;
+  /** Epoch milliseconds when the alert was raised. */
+  at: number;
+}
+
+/**
+ * Injected sink for health-degradation alerts. Left as a seam so this module
+ * stays free of a concrete alerting dependency, mirroring the publisher's
+ * `AlertHook` (#D014) — wire it to Sentry, a pager, or the ledger writer.
+ */
+export type HealthAlertHook = (alert: HealthAlert) => void | Promise<void>;
+
+/** Tuning for `AnchorHealthTracker`; every field defaults to `lib/reputation/thresholds.ts`. */
+export interface HealthTrackerOptions {
+  /** Consecutive failing cycles before `healthy` → `degraded`. */
+  degradeAfter?: number;
+  /** Consecutive failing cycles before escalating to `down`. */
+  downAfter?: number;
+  /** Quote round-trip budget (ms) for the latency dimension. */
+  latencyBudgetMs?: number;
+  /** Called once per degrading transition. */
+  onAlert?: HealthAlertHook;
+  /** Monotonic-ish millisecond clock. Defaults to `Date.now`. */
+  now?: () => number;
+}
+
+/** An anchor's tracked health, shaped to match the nightly ledger's `AnchorHealth`. */
+export interface AnchorHealthState {
+  status: AnchorHealthStatus;
+  /** Consecutive failing cycles; reset to 0 by any clean cycle. */
+  consecutiveFailures: number;
+  /** Dimensions that failed during the current streak; empty when healthy. */
+  dimensions: ProbeDimension[];
+}
+
+/**
+ * Debounced per-anchor health state machine over probe cycles.
+ *
+ * Feed it one cycle per anchor per run: a failing cycle extends the anchor's
+ * streak, a clean one resets it. The streak length maps to a composite status
+ * via `healthStatusFor`, and an alert fires only when that status crosses into
+ * a strictly worse state — so N-1 consecutive failures stay silent, the Nth
+ * raises exactly one alert naming the failing dimension(s), and further
+ * failures at the same level raise none. Recovery clears the streak silently;
+ * this path alerts on degradation only.
+ */
+export class AnchorHealthTracker {
+  private readonly states = new Map<string, AnchorHealthState>();
+  private readonly degradeAfter: number;
+  private readonly downAfter: number;
+  private readonly latencyBudgetMs: number;
+  private readonly onAlert: HealthAlertHook | undefined;
+  private readonly now: () => number;
+
+  constructor(options: HealthTrackerOptions = {}) {
+    this.degradeAfter = options.degradeAfter ?? DEGRADE_AFTER_FAILURES;
+    this.downAfter = options.downAfter ?? DOWN_AFTER_FAILURES;
+    this.latencyBudgetMs = options.latencyBudgetMs ?? LATENCY_BUDGET_MS;
+    this.onAlert = options.onAlert;
+    this.now = options.now ?? Date.now;
+  }
+
+  /** Feed one probe cycle for one anchor. Returns the alert raised, or `null`. */
+  async observe(anchorId: string, cycle: ProbeCycle): Promise<HealthAlert | null> {
+    return this.observeFailures(anchorId, failingDimensions(cycle, this.latencyBudgetMs));
+  }
+
+  /**
+   * Lower-level entry point for callers that already know which dimensions
+   * failed (e.g. a dimension this module doesn't model yet).
+   */
+  async observeFailures(
+    anchorId: string,
+    failing: readonly ProbeDimension[]
+  ): Promise<HealthAlert | null> {
+    const prev = this.statusOf(anchorId);
+
+    if (failing.length === 0) {
+      this.states.set(anchorId, { status: 'healthy', consecutiveFailures: 0, dimensions: [] });
+      if (prev.status !== 'healthy') {
+        logger.info(
+          { event: 'probe.health.recovered', anchorId, from: prev.status },
+          'anchor recovered to healthy'
+        );
+      }
+      return null;
+    }
+
+    const streakDimensions = PROBE_DIMENSIONS.filter(
+      (d) => prev.dimensions.includes(d) || failing.includes(d)
+    );
+    const consecutiveFailures = prev.consecutiveFailures + 1;
+    const status = healthStatusFor(consecutiveFailures, this.degradeAfter, this.downAfter);
+    this.states.set(anchorId, { status, consecutiveFailures, dimensions: streakDimensions });
+
+    if (!isDegradingTransition(prev.status, status)) {
+      logger.debug(
+        {
+          event: 'probe.health.failure',
+          anchorId,
+          status,
+          consecutiveFailures,
+          dimensions: failing,
+        },
+        'probe cycle failed but health status is unchanged'
+      );
+      return null;
+    }
+
+    const alert: HealthAlert = {
+      anchorId,
+      from: prev.status,
+      to: status,
+      dimensions: streakDimensions,
+      consecutiveFailures,
+      at: this.now(),
+    };
+    logger.warn(
+      {
+        event: 'probe.health.transition',
+        anchorId,
+        from: alert.from,
+        to: alert.to,
+        dimensions: alert.dimensions,
+        consecutiveFailures,
+      },
+      `anchor health degraded to ${status} (${alert.dimensions.join(', ')})`
+    );
+    await this.onAlert?.(alert);
+    return alert;
+  }
+
+  /** Current tracked health for an anchor; unseen anchors read as healthy with no streak. */
+  statusOf(anchorId: string): AnchorHealthState {
+    const state = this.states.get(anchorId);
+    if (!state) return { status: 'healthy', consecutiveFailures: 0, dimensions: [] };
+    return { ...state, dimensions: [...state.dimensions] };
+  }
+
+  /** Every tracked anchor's health, keyed by anchor id — the shape the auto-degrade ledger consumes. */
+  snapshot(): Record<string, AnchorHealthState> {
+    const out: Record<string, AnchorHealthState> = {};
+    for (const anchorId of this.states.keys()) {
+      out[anchorId] = this.statusOf(anchorId);
+    }
+    return out;
+  }
 }

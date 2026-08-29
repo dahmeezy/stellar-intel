@@ -1,4 +1,8 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type { Metadata } from 'next';
+import { marked } from 'marked';
+import { PROSE_CLASSES } from '@/lib/prose';
 
 const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL ?? 'https://stellar-intel.vercel.app';
 const TITLE = 'Methodology — Stellar Intel';
@@ -18,7 +22,7 @@ export const metadata: Metadata = {
         url: new URL('/opengraph-image', SITE_URL).toString(),
         width: 1200,
         height: 630,
-        alt: 'Stellar Intel — Real-time rate comparison on Stellar',
+        alt: 'Stellar Intel — The execution layer for stablecoin off-ramps',
       },
     ],
   },
@@ -29,14 +33,22 @@ export const metadata: Metadata = {
   },
 };
 
+// Renders docs/ANCHOR_REPUTATION.md directly rather than duplicating its
+// content in this component, so the doc stays the single source of truth —
+// editing it is the only way to update this page.
+function renderMethodologyDoc(): string {
+  const source = readFileSync(join(process.cwd(), 'docs/ANCHOR_REPUTATION.md'), 'utf-8');
+  return marked.parse(source, { async: false });
+}
+
+// Shared with /terms so both markdown-rendered pages look identical.
+
 export default function MethodologyPage() {
+  const html = renderMethodologyDoc();
+
   return (
-    <main className="mx-auto max-w-4xl space-y-6 px-4 py-8">
-      <h1 className="text-3xl font-semibold text-gray-900 dark:text-white">Methodology</h1>
-      <p className="text-base text-gray-600 dark:text-gray-300">
-        Stellar Intel evaluates anchors by combining corridor coverage, recent outcome history, and
-        reputation signals to help users compare off-ramp options.
-      </p>
+    <main className="mx-auto max-w-4xl px-4 py-8">
+      <div className={PROSE_CLASSES} dangerouslySetInnerHTML={{ __html: html }} />
     </main>
   );
 }

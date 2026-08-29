@@ -17,6 +17,11 @@ export const envSchema = z.object({
     .url()
     .optional()
     .default('https://api.stellar.expert/explorer/public'),
+  // Defaults to first-match, matching .env.example's "Keep on first-match until
+  // the scored strategy is validated in staging". The code default said
+  // 'scored', so the documented default and the actual one disagreed — and now
+  // that the intent API honours this flag (#790), scored also puts a live rate
+  // fan-out on the intent request path. Opting in stays one env var.
   ROUTING_STRATEGY: z.enum(['first-match', 'scored']).default('first-match'),
   FEE_BUDGET_PCT: z.preprocess(
     (value) => {

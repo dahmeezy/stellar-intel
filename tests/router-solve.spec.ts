@@ -177,7 +177,7 @@ describe('solveSingleAnchor', () => {
       }
     });
 
-    it('defaults to the ROUTING_STRATEGY flag value (first-match)', () => {
+    it('scores quotes when the scored strategy is selected', () => {
       const intent = createTestIntent({ minReceive: '1500' });
 
       const quotes = [
@@ -197,11 +197,71 @@ describe('solveSingleAnchor', () => {
         }),
       ];
 
-      const result = solveSingleAnchor(intent, quotes);
+      // Strategy passed explicitly. It used to rely on ROUTING_STRATEGY
+      // defaulting to 'scored', but .env.example documents first-match as the
+      // default until scored is validated in staging, and the code default now
+      // matches that (#790).
+      const result = solveSingleAnchor(intent, quotes, undefined, undefined, 'scored');
 
       expect(result.ok).toBe(true);
       if (result.ok) {
-        expect(result.plan.quoteId).toBe('quote-001');
+        expect(result.plan.quoteId).toBe('quote-002');
+      }
+    });
+
+    it('selects the correct highest-scored anchor given a fixture set of anchors with varying rate, reliability, and latency', () => {
+      const intent = createTestIntent({ minReceive: '140000' });
+
+      const quotes = [
+        createTestQuote({
+          id: 'quote-flaky-high-rate',
+          anchorId: 'flaky-anchor',
+          anchorName: 'Flaky High Rate Anchor',
+          buy_amount: '150000',
+          netAmount: '150000',
+        }),
+        createTestQuote({
+          id: 'quote-fast-reliable',
+          anchorId: 'reliable-anchor',
+          anchorName: 'Fast & Reliable Anchor',
+          buy_amount: '149000',
+          netAmount: '149000',
+        }),
+        createTestQuote({
+          id: 'quote-slow-medium',
+          anchorId: 'slow-anchor',
+          anchorName: 'Slow Anchor',
+          buy_amount: '145000',
+          netAmount: '145000',
+        }),
+      ];
+
+      const scoring = {
+        anchorMetrics: {
+          'flaky-anchor': {
+            reliability: 0.5,
+            latencyMs: 1500,
+            reputationComposite: 0.4,
+          },
+          'reliable-anchor': {
+            reliability: 0.99,
+            latencyMs: 100,
+            reputationComposite: 0.95,
+          },
+          'slow-anchor': {
+            reliability: 0.8,
+            latencyMs: 2200,
+            reputationComposite: 0.7,
+          },
+        },
+      };
+
+      const result = solveSingleAnchor(intent, quotes, 10, scoring, 'scored');
+
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.plan.anchorId).toBe('reliable-anchor');
+        expect(result.plan.quoteId).toBe('quote-fast-reliable');
       }
     });
   });
@@ -243,7 +303,11 @@ describe('solveSingleAnchor', () => {
         }),
       ];
 
-      const result = solveSingleAnchor(intent, quotes);
+      // Strategy passed explicitly. It used to rely on ROUTING_STRATEGY
+      // defaulting to 'scored', but .env.example documents first-match as the
+      // default until scored is validated in staging, and the code default now
+      // matches that (#790).
+      const result = solveSingleAnchor(intent, quotes, undefined, undefined, 'scored');
 
       expect(result.ok).toBe(true);
       if (result.ok) {

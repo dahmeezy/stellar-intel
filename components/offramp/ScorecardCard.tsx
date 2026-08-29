@@ -71,6 +71,11 @@ function toObject(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : null;
 }
 
+function toTimestamp(value: unknown): string | null {
+  if (typeof value !== 'string' || value.trim() === '') return null;
+  return Number.isNaN(Date.parse(value)) ? null : value;
+}
+
 function scorecardKey(timeframe: ReputationWindow): string {
   return timeframe.replace('d', '');
 }
@@ -97,8 +102,16 @@ function parseNestedScorecard(
     slippageP50: slippageP50 !== null ? slippageP50 * 100 : null,
     slippageP95: slippageP95 !== null ? slippageP95 * 100 : null,
     outcomesCount: toNumber(scorecard.sampleSize) ?? 0,
-    computedAt: (scorecard.computedAt as string | null) ?? null,
-    lastPublisherTxTimestamp: (scorecard.lastPublisherTxTimestamp as string | null) ?? null,
+    computedAt:
+      toTimestamp(scorecard.computedAt) ??
+      toTimestamp(scorecard.computed_at) ??
+      toTimestamp(payload.computedAt) ??
+      toTimestamp(payload.computed_at),
+    lastPublisherTxTimestamp:
+      toTimestamp(scorecard.lastPublisherTxTimestamp) ??
+      toTimestamp(scorecard.last_publisher_tx_timestamp) ??
+      toTimestamp(payload.lastPublisherTxTimestamp) ??
+      toTimestamp(payload.last_publisher_tx_timestamp),
   };
 }
 
@@ -135,8 +148,18 @@ function parseReputationResponse(body: unknown, timeframe: ReputationWindow): Re
           payload.slippageP95Percent
       ) ?? null,
     outcomesCount: toNumber(payload.outcomes_count ?? payload.outcomesCount) ?? 0,
-    computedAt: (payload.computedAt as string | null) ?? null,
-    lastPublisherTxTimestamp: (payload.lastPublisherTxTimestamp as string | null) ?? null,
+    computedAt:
+      toTimestamp(payload.computedAt) ??
+      toTimestamp(payload.computed_at) ??
+      toTimestamp(payload.lastProbeAt) ??
+      toTimestamp(payload.last_probe_at) ??
+      toTimestamp(payload.lastProbedAt) ??
+      toTimestamp(payload.last_probed_at),
+    lastPublisherTxTimestamp:
+      toTimestamp(payload.lastPublisherTxTimestamp) ??
+      toTimestamp(payload.last_publisher_tx_timestamp) ??
+      toTimestamp(payload.publisherTxTimestamp) ??
+      toTimestamp(payload.publisher_tx_timestamp),
   };
 }
 
@@ -192,7 +215,11 @@ function FreshnessBadge({ freshness }: { freshness: FreshnessResult | null }) {
   const drift = freshness.driftMs ? formatDrift(freshness.driftMs) : null;
 
   return (
-    <div className={`rounded-lg border border-gray-200 ${colors.bg} p-3 dark:border-gray-700`}>
+    <div
+      className={`rounded-lg border border-gray-200 ${colors.bg} p-3 dark:border-gray-700`}
+      role="status"
+      aria-label={`Probe health: ${label}`}
+    >
       <div className="flex items-center gap-2">
         <div className={colors.icon}>
           {freshness.status === 'fresh' && (
@@ -233,8 +260,7 @@ function FreshnessBadge({ freshness }: { freshness: FreshnessResult | null }) {
 }
 
 const STELLAR_EXPERT_TX_BASE = 'https://stellar.expert/explorer/public/tx';
-const METHODOLOGY_DOC_URL =
-  'https://github.com/ezedike-evan/stellar-intel/blob/main/docs/ANCHOR_REPUTATION.md';
+const METHODOLOGY_DOC_URL = '/methodology';
 
 function CompositeScoreBreakdown({
   fillRate,
@@ -365,10 +391,12 @@ export function ScorecardCard({
         if (!isActive) return;
         const parsedMetrics = parseReputationResponse(body, timeframe);
         setMetrics(parsedMetrics);
-        if (parsedMetrics.computedAt) {
-          setFreshness(
-            calculateFreshness(parsedMetrics.computedAt, parsedMetrics.lastPublisherTxTimestamp)
-          );
+        // Probe-backed responses may omit computedAt while still exposing the
+        // publisher's latest observation — fall back to that rather than
+        // leaving the badge stuck on "unknown".
+        const healthTimestamp = parsedMetrics.computedAt ?? parsedMetrics.lastPublisherTxTimestamp;
+        if (healthTimestamp) {
+          setFreshness(calculateFreshness(healthTimestamp, parsedMetrics.lastPublisherTxTimestamp));
         }
       })
       .catch((fetchError) => {
@@ -441,7 +469,7 @@ export function ScorecardCard({
               target="_blank"
               rel="noopener noreferrer"
               aria-label="View latest oracle transaction on stellar.expert"
-              className="text-gray-400 hover:text-blue-500 dark:text-gray-500 dark:hover:text-blue-400 transition-colors"
+              className="text-secondary-text hover:text-blue-500 dark:hover:text-blue-400 transition-colors"
             >
               <ExternalLink className="h-3.5 w-3.5" />
             </a>
@@ -506,7 +534,7 @@ export function ScorecardCard({
                   }
                 >
                   <Info
-                    className="h-3.5 w-3.5 text-gray-400 dark:text-gray-500"
+                    className="h-3.5 w-3.5 text-secondary-text"
                     aria-label="How the composite score is calculated"
                   />
                 </Tooltip>
